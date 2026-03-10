@@ -4,6 +4,9 @@ experiment_script/log
 
 **/__pycache__/
 LCRL/policy/__pycache__/
+wandb/*
+eval*/
+checkpoints/*
 experiment_script/visualization/log/
 experiment_script/final_runs/log
 experiment_script/final_runs/data

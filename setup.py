@@ -15,7 +15,7 @@ def get_version() -> str:
 
 def get_install_requires() -> str:
     return [
-        "gymnasium==0.28.1",
+      
         "tqdm",
         "numpy==1.26.4",  # https://github.com/numpy/numpy/issues/12793
         "tensorboard>=2.5.0",

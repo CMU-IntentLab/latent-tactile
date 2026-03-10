@@ -7,7 +7,7 @@ from torch import nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Dict
 from torchvision import transforms
 from scipy.spatial.transform import Rotation
 
@@ -212,9 +212,9 @@ class MultiHeadAttention(nn.Module):
 
 class TransformerBlock(nn.Module):
     def __init__(self, dim: int, heads: int, dim_head: int, mlp_dim: int, dropout: float = 0., 
-                 num_frames: int = 2):
+                 num_frames: int = 2, patches_per_frame: int = 256):
         super().__init__()
-        self.attn = MultiHeadAttention(dim, heads, dim_head, dropout, num_frames)
+        self.attn = MultiHeadAttention(dim, heads, dim_head, dropout, num_frames, patches_per_frame)
         self.ff = FeedForward(dim, mlp_dim, dropout)
         self.norm1 = LayerNorm(dim)
         self.norm2 = LayerNorm(dim)
@@ -367,7 +367,165 @@ class VideoTransformer(nn.Module):
         video = video.view(b * f, c, h, w)
         features = self.dino.forward_features(video)['x_norm_patchtokens']
         return features.view(b, f, -1, features.shape[-1])
-    
+
+
+class TactileVideoTransformer(nn.Module):
+    """
+    Flexible world model for tactile dataset with configurable cameras.
+    Conditions on a subset of camera embeddings and predicts future embeddings
+    for selected cameras. Uses DINOv3 (768-dim) for vision, supports AnyTouch (512-dim) for tactile.
+    """
+
+    # Default embedding dims: DINOv3 ViT-B/16 = 768, AnyTouch = 512
+    DEFAULT_CAMERA_DIMS = {"camera_0": 768, "camera_1": 768, "camera_2": 512}
+
+    def __init__(
+        self,
+        *,
+        cameras: List[str],
+        camera_dims: Optional[Dict[str, int]] = None,
+        condition_cameras: Optional[List[str]] = None,
+        predict_cameras: Optional[List[str]] = None,
+        common_dim: int = 384,
+        ac_dim: int = 10,
+        state_dim: int = 8,
+        patches_per_frame: int = 196,
+        depth: int = 6,
+        heads: int = 16,
+        mlp_dim: int = 2048,
+        num_frames: int = 3,
+        dim_head: int = 64,
+        dropout: float = 0.1,
+        emb_dropout: float = 0.0,
+    ):
+        super().__init__()
+        camera_dims = camera_dims or self.DEFAULT_CAMERA_DIMS
+        condition_cameras = condition_cameras or cameras
+        predict_cameras = predict_cameras or cameras
+
+        for c in condition_cameras + predict_cameras:
+            if c not in camera_dims:
+                raise ValueError(f"Unknown camera '{c}'. Choose from {list(camera_dims.keys())}")
+
+        self.cameras = cameras
+        self.condition_cameras = condition_cameras
+        self.predict_cameras = predict_cameras
+        self.camera_dims = camera_dims
+        self.common_dim = common_dim
+        self.patches_per_frame = patches_per_frame
+
+        # Project each camera to common_dim
+        self.project_in = nn.ModuleDict()
+        for cam in condition_cameras:
+            dim_in = camera_dims[cam]
+            self.project_in[cam] = nn.Sequential(
+                nn.Linear(dim_in, common_dim),
+                nn.LayerNorm(common_dim),
+                nn.ReLU(),
+            )
+
+        # Action encoder
+        self.action_encoder = nn.Sequential(
+            nn.Linear(7, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, ac_dim),
+            nn.LayerNorm(ac_dim),
+        )
+
+        total_dim = len(condition_cameras) * common_dim + ac_dim + state_dim
+        self.pos_embedding = nn.Parameter(torch.randn(1, patches_per_frame, total_dim) * 0.02)
+        self.temp_embedding = nn.Parameter(torch.randn(1, num_frames, total_dim) * 0.02)
+        self.dropout = nn.Dropout(emb_dropout)
+
+        self.transformer = nn.ModuleList([
+            TransformerBlock(total_dim, heads, dim_head, mlp_dim, dropout, num_frames, patches_per_frame)
+            for _ in range(depth)
+        ])
+
+        # Prediction heads: one per predict_camera, output to original dim
+        self.heads = nn.ModuleDict()
+        for cam in predict_cameras:
+            dim_out = camera_dims[cam]
+            self.heads[cam] = nn.Sequential(
+                LayerNorm(total_dim),
+                nn.Linear(total_dim, total_dim),
+                nn.ReLU(),
+                nn.Linear(total_dim, dim_out),
+            )
+
+        self.state_head = nn.Sequential(
+            LayerNorm(total_dim),
+            nn.Linear(total_dim, total_dim),
+            nn.ReLU(),
+            nn.Linear(total_dim, state_dim),
+        )
+
+    def forward(
+        self,
+        camera_inputs: Dict[str, torch.Tensor],
+        states: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+        """
+        Args:
+            camera_inputs: Dict[cam_name, (B, T, num_patches, dim)]
+            states: (B, T, state_dim)
+            actions: (B, T, 7)
+
+        Returns:
+            preds: Dict[cam_name, (B, T, num_patches, dim)]
+            pred_state: (B, T, state_dim)
+        """
+        x = self.forward_features(camera_inputs, states, actions)
+        preds = {}
+        for cam in self.predict_cameras:
+            preds[cam] = self.heads[cam](x)
+        pred_state = self.state_head(x)
+        pred_state = torch.mean(pred_state, dim=2)
+        return preds, pred_state
+
+    def forward_features(
+        self,
+        camera_inputs: Dict[str, torch.Tensor],
+        states: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Concatenate and process camera embeddings."""
+        batch_size, num_frames, num_patches, _ = next(iter(camera_inputs.values())).shape
+        if num_patches != self.patches_per_frame:
+            raise ValueError(
+                f"Expected {self.patches_per_frame} patches per frame, got {num_patches}. "
+                "Use ensure_patch_grid to resize embeddings."
+            )
+
+        # Project each camera
+        projected = []
+        for cam in self.condition_cameras:
+            if cam not in camera_inputs:
+                raise ValueError(f"Missing camera '{cam}' in inputs")
+            proj = self.project_in[cam](camera_inputs[cam])
+            projected.append(proj)
+        x = torch.cat(projected, dim=-1)
+
+        # Action and state embeddings
+        action_emb = self.action_encoder(actions).unsqueeze(2).expand(-1, -1, num_patches, -1)
+        state_emb = states.unsqueeze(2).expand(-1, -1, num_patches, -1)
+        x = torch.cat([x, action_emb, state_emb], dim=-1)
+
+        x = x + self.pos_embedding
+        x = x + self.temp_embedding[:, :num_frames].unsqueeze(2)
+
+        x = rearrange(x, "b s n d -> b (s n) d")
+        x = self.dropout(x)
+
+        for block in self.transformer:
+            x = block(x)
+
+        x = rearrange(x, "b (s n) d -> b s n d", s=num_frames)
+        return x
+
 
 import torch
 import einops
