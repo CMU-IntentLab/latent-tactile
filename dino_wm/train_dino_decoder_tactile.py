@@ -469,14 +469,22 @@ def train_one_decoder(
     params = list(decoder.parameters())
     optimizer = AdamW(params, lr=args.lr)
     best_eval = float("inf")
+    best_eval_adv = float("inf")  # best in adversarial phase (i >= adv_start_iter)
     train_iter = iter(train_loader)
     eval_iter = iter(eval_loader)
 
-    discriminator = None
+    discriminators = None
     disc_optimizer = None
     if args.loss == "rae":
-        discriminator = PatchDiscriminator(ndf=64, n_layers=3).to(device)
-        disc_optimizer = AdamW(discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9))
+        discriminators = nn.ModuleDict(
+            {cam: PatchDiscriminator(ndf=64, n_layers=3).to(device) for cam in camera_group}
+        )
+        disc_optimizer = AdamW(
+            [p for d in discriminators.values() for p in d.parameters()],
+            lr=args.lr,
+            betas=(0.5, 0.9),
+        )
+        print(f"  Using per-camera discriminators: {list(discriminators.keys())}")
         if not HAS_LPIPS:
             print("  Warning: lpips not installed. Using VGG perceptual as LPIPS fallback. pip install lpips for RAE.")
 
@@ -499,6 +507,7 @@ def train_one_decoder(
         targets_dict = {}
         loss_l1_sum, loss_lpips_sum = 0.0, 0.0
         loss_gan_val, loss_disc_val = None, None
+        loss_d_per_cam = {}
 
         for cam in camera_group:
             embd = data[f"{cam}_embd"].to(device)
@@ -530,11 +539,13 @@ def train_one_decoder(
             loss_lpips_sum /= len(camera_group)
 
         # RAE: add adversarial loss with adaptive lambda (paper Sec 3, Table 12)
-        if args.loss == "rae" and i >= args.adv_start_iter and discriminator is not None:
+        # Per-camera discriminators to prevent mode collapse across different camera modalities
+        if args.loss == "rae" and i >= args.adv_start_iter and discriminators is not None:
             total_gan = 0.0
             for cam in camera_group:
                 pred = preds_dict[cam]
                 target = targets_dict[cam]
+                disc = discriminators[cam]
                 pred_flat = _ensure_rgb(pred.reshape(-1, *pred.shape[2:]))
                 target_flat = _ensure_rgb(target.reshape(-1, *target.shape[2:]))
                 if pred_flat.shape[-2:] != (224, 224):
@@ -543,7 +554,7 @@ def train_one_decoder(
                     )
                 else:
                     pred_224 = pred_flat
-                fake_score = discriminator(pred_224)
+                fake_score = disc(pred_224)
                 gan_loss_gen = -fake_score.mean()  # hinge: generator maximizes D(fake)
 
                 L_rec_cam = compute_loss(pred, target, args)
@@ -562,13 +573,15 @@ def train_one_decoder(
         total_loss.backward()
         optimizer.step()
 
-        # RAE: train discriminator (paper: disc starts at epoch 6)
-        if args.loss == "rae" and i >= args.disc_start_iter and discriminator is not None:
+        # RAE: train discriminators (one per camera to prevent mode collapse)
+        if args.loss == "rae" and i >= args.disc_start_iter and discriminators is not None:
             disc_optimizer.zero_grad()
             loss_d_total = 0.0
+            loss_d_per_cam = {}
             for cam in camera_group:
                 pred = preds_dict[cam].detach()
                 target = targets_dict[cam]
+                disc = discriminators[cam]
                 pred_flat = _ensure_rgb(pred.reshape(-1, *pred.shape[2:]))
                 target_flat = _ensure_rgb(target.reshape(-1, *target.shape[2:]))
                 if pred_flat.shape[-2:] != (224, 224):
@@ -581,11 +594,13 @@ def train_one_decoder(
                 else:
                     pred_224 = pred_flat
                     target_224 = target_flat
-                real_score = discriminator(target_224)
-                fake_score = discriminator(pred_224)
+                real_score = disc(target_224)
+                fake_score = disc(pred_224)
                 loss_d_real = nn.functional.relu(1.0 - real_score).mean()
                 loss_d_fake = nn.functional.relu(1.0 + fake_score).mean()
-                loss_d_total = loss_d_total + loss_d_real + loss_d_fake
+                loss_d_cam = loss_d_real + loss_d_fake
+                loss_d_total = loss_d_total + loss_d_cam
+                loss_d_per_cam[cam] = loss_d_cam.item()
             loss_disc_val = (loss_d_total / len(camera_group)).item()
             (loss_d_total / len(camera_group)).backward()
             disc_optimizer.step()
@@ -601,6 +616,8 @@ def train_one_decoder(
                     log_dict["loss_gan"] = loss_gan_val
                 if loss_disc_val is not None:
                     log_dict["loss_disc"] = loss_disc_val
+                for cam, val in loss_d_per_cam.items():
+                    log_dict[f"loss_disc_{cam}"] = val
             wandb.log(log_dict)
         if i % 50 == 0:
             parts = [f"Loss: {total_loss.item():.4f}"]
@@ -643,22 +660,65 @@ def train_one_decoder(
                         log_images[f"eval_{cam}_pred"] = wandb.Image(pred_img, caption=f"{cam} decoded")
                 eval_loss /= len(camera_group)
 
-            if eval_loss < best_eval:
+         in_adv_phase = (
+                args.loss == "rae"
+                and i >= args.adv_start_iter
+                and discriminators is not None
+            )
+            if in_adv_phase:
+                if eval_loss < best_eval_adv:
+                    best_eval_adv = eval_loss
+                    os.makedirs(args.output_dir, exist_ok=True)
+                    base = f"decoder_{group_name.replace('+', '_')}_adv"
+                    torch.save(decoder.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
+                    if discriminators is not None:
+                        torch.save(
+                            discriminators.state_dict(),
+                            os.path.join(args.output_dir, f"discriminators_{group_name.replace('+', '_')}_adv.pth"),
+                        )
+            elif eval_loss < best_eval:
                 best_eval = eval_loss
                 os.makedirs(args.output_dir, exist_ok=True)
-                ckpt_path = os.path.join(args.output_dir, f"decoder_{group_name.replace('+', '_')}.pth")
-                torch.save(decoder.state_dict(), ckpt_path)
-            ## also save every 5000 iters 
+                base = f"decoder_{group_name.replace('+', '_')}"
+                torch.save(decoder.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
+                if discriminators is not None:
+                    torch.save(
+                        discriminators.state_dict(),
+                        os.path.join(args.output_dir, f"discriminators_{group_name.replace('+', '_')}.pth"),
+                    )
+            ## also save every 5000 iters
             if i % 5000 == 0:
                 os.makedirs(args.output_dir, exist_ok=True)
                 ckpt_path = os.path.join(args.output_dir, f"decoder_{group_name.replace('+', '_')}_{i}.pth")
                 torch.save(decoder.state_dict(), ckpt_path)
+                if discriminators is not None:
+                    disc_path = os.path.join(args.output_dir, f"discriminators_{group_name.replace('+', '_')}_{i}.pth")
+                    torch.save(discriminators.state_dict(), disc_path)
 
             if args.wandb and HAS_WANDB:
-                wandb.log({"eval_loss": eval_loss, **log_images})
+                wandb.log({
+                    "eval_loss": eval_loss,
+                    "best_eval": best_eval,
+                    "best_eval_adv": best_eval_adv,
+                    **log_images,
+                })
             print()
-            print(f"  Eval Loss: {eval_loss:.4f} (best: {best_eval:.4f})")
+            best_str = f"best: {best_eval:.4f}"
+            if args.loss == "rae" and discriminators is not None:
+                best_str += f", best_adv: {best_eval_adv:.4f}"
+            print(f"  Eval Loss: {eval_loss:.4f} ({best_str})")
             decoder.train()
+
+    # Save last checkpoint
+    os.makedirs(args.output_dir, exist_ok=True)
+    base = f"decoder_{group_name.replace('+', '_')}_last"
+    torch.save(decoder.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
+    if discriminators is not None:
+        torch.save(
+            discriminators.state_dict(),
+            os.path.join(args.output_dir, f"discriminators_{group_name.replace('+', '_')}_last.pth"),
+        )
+    print(f"  Saved last checkpoint to {args.output_dir}/")
 
     return decoder
 
