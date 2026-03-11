@@ -127,11 +127,12 @@ def create_episode_videos(
             if raw_actions.shape[-1] <= args.gripper_idx:
                 continue
             gripper_vals = raw_actions[:, args.gripper_idx]
-            closed_mask = gripper_vals <= args.gripper_closed_threshold
+            closed_mask = gripper_vals >= args.gripper_closed_threshold
             closed_indices = np.where(closed_mask)[0]
             if len(closed_indices) == 0:
                 continue
             start_idx = int(closed_indices[0])
+            print(f"Start index: {start_idx}")
             if T_total - start_idx < args.segment_length:
                 continue
         T = min(T_total - start_idx, args.max_episode_len)
@@ -149,48 +150,69 @@ def create_episode_videos(
                 gt_img = gt_img / 255.0
             all_gt_imgs.append(np.clip(gt_img, 0, 1))
 
-        # Build initial inputs (sliced from start_idx)
+        # Build full episode tensors (sliced from start_idx)
         states = torch.tensor(ep_data["states"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
         actions = torch.tensor(ep_data["actions"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
         if actions.shape[-1] > 7:
             actions = actions[..., :7]
         actions = normalize_acs(actions, device)
 
-        inputs = {}
+        # Pre-load all embeddings for condition cameras (for GT resets)
+        all_embds = {}
         for c in condition_cameras:
             emb = torch.tensor(ep_data[f"{c}_embd"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
-            inputs[c] = ensure_patch_grid(emb, PATCH_SIDE_DINOV3)[:, :H]
-        inp_states = states[:, :H]
-        inp_acs = actions[:, :H]
+            all_embds[c] = ensure_patch_grid(emb, PATCH_SIDE_DINOV3)
 
         pred_imgs = [[all_gt_imgs[i][t].copy() for t in range(T)] for i in range(len(predict_cameras))]
 
-        # Autoregressive rollout
+        # Chunked autoregressive rollout: reset to GT state/frames every chunk
+        # First chunk: 8 steps. Subsequent chunks: 8-16 steps (configurable).
+        chunk_size = args.chunk_size
+        
+
         with torch.no_grad():
-            for k in range(T - H):
-                preds, pred_state = transition(inputs, inp_states, inp_acs)
-                next_embds = {c: preds[c][:, -1:] for c in predict_cameras}
-                next_state = pred_state[:, -1:]
+            chunk_start = 0
+            chunk_idx = 0
+            while chunk_start + H < T:
+               
+                chunk_size = min(chunk_size, T - chunk_start - H)  # don't exceed episode
+                if chunk_size <= 0:
+                    break
 
-                for i, cam in enumerate(predict_cameras):
-                    if cam in decoders:
-                        emb = next_embds[cam]
-                        pred_img, _ = decoders[cam](emb)
-                        pred_img = rearrange(pred_img, "(b t) c h w -> b t c h w", t=1)
-                        pred_img = pred_img[0, 0].cpu().numpy().transpose(1, 2, 0)
-                        pred_imgs[i][H + k] = np.clip(pred_img, 0, 1)
-
+                # Reset context from GT at chunk_start
+                inputs = {}
                 for c in condition_cameras:
-                    if c in predict_cameras:
-                        inputs[c] = torch.cat([inputs[c][:, 1:], next_embds[c]], dim=1)
-                    else:
-                        next_gt = torch.tensor(
-                            ep_data[f"{c}_embd"][start_idx + H + k], dtype=torch.float32, device=device
-                        ).unsqueeze(0).unsqueeze(0)
-                        inputs[c] = torch.cat([inputs[c][:, 1:], ensure_patch_grid(next_gt, PATCH_SIDE_DINOV3)], dim=1)
-                inp_states = torch.cat([inp_states[:, 1:], next_state], dim=1)
-                if H + k + 1 < actions.shape[1]:
-                    inp_acs = torch.cat([inp_acs[:, 1:], actions[:, H + k : H + k + 1]], dim=1)
+                    inputs[c] = all_embds[c][:, chunk_start : chunk_start + H]
+                inp_states = states[:, chunk_start : chunk_start + H]
+                inp_acs = actions[:, chunk_start : chunk_start + H]
+
+                # Predict chunk_size frames autoregressively
+                for k in range(chunk_size):
+                    preds, pred_state = transition(inputs, inp_states, inp_acs)
+                    next_embds = {c: preds[c][:, -1:] for c in predict_cameras}
+                    next_state = pred_state[:, -1:]
+
+                    t_pred = chunk_start + H + k
+                    for i, cam in enumerate(predict_cameras):
+                        if cam in decoders:
+                            emb = next_embds[cam]
+                            pred_img, _ = decoders[cam](emb)
+                            pred_img = rearrange(pred_img, "(b t) c h w -> b t c h w", t=1)
+                            pred_img = pred_img[0, 0].cpu().numpy().transpose(1, 2, 0)
+                            pred_imgs[i][t_pred] = np.clip(pred_img, 0, 1)
+
+                    # Roll context window forward
+                    for c in condition_cameras:
+                        if c in predict_cameras:
+                            inputs[c] = torch.cat([inputs[c][:, 1:], next_embds[c]], dim=1)
+                        else:
+                            next_gt = all_embds[c][:, chunk_start + H + k : chunk_start + H + k + 1]
+                            inputs[c] = torch.cat([inputs[c][:, 1:], next_gt], dim=1)
+                    inp_states = torch.cat([inp_states[:, 1:], next_state], dim=1)
+                    inp_acs = torch.cat([inp_acs[:, 1:], actions[:, chunk_start + k + 1 : chunk_start + k + 2]], dim=1)
+
+                chunk_start += chunk_size
+                chunk_idx += 1
 
         # Build video: gt | pred | diff per frame, cameras concatenated horizontally
         frames = []
@@ -342,6 +364,13 @@ def parse_args():
         default=-0.5,
         help="Gripper is closed when action[gripper_idx] <= this (default -0.5 for [-1,1] scale)",
     )
+    p.add_argument(
+        "--chunk_size",
+        type=int,
+        default=8,
+        help="Number of steps to predict in the chunk before resetting to GT (default 8)",
+    )
+
     return p.parse_args()
 
 
@@ -497,8 +526,8 @@ def main():
             device=device,
         )
         wandb.log({
-            "eval_mse_loss": mean_loss,
-            **(wandb_images or {}),
+            # "eval_mse_loss": mean_loss,
+            # **(wandb_images or {}),
             **episode_videos,
         })
     elif args.wandb and HAS_WANDB:

@@ -217,6 +217,22 @@ def parse_args():
         default=800,
         help="Start adding adversarial loss to decoder at this iter (paper: epoch 8)",
     )
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="DataLoader workers for parallel data loading (0 = main thread only)",
+    )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="Use automatic mixed precision for faster training",
+    )
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile for faster training (PyTorch 2.0+)",
+    )
     return p.parse_args()
 
 
@@ -352,8 +368,10 @@ def _get_perceptual_loss(device: torch.device) -> PerceptualLoss:
     return _perceptual_loss_cache[device]
 
 
-def compute_loss(pred: torch.Tensor, target: torch.Tensor, args) -> torch.Tensor:
-    """Compute loss based on args.loss. Resizes target to pred size if needed."""
+def compute_loss(pred: torch.Tensor, target: torch.Tensor, args, return_rae_components: bool = False):
+    """Compute loss based on args.loss. Resizes target to pred size if needed.
+    When return_rae_components=True and loss=rae, returns (loss, (l1, lpips)).
+    """
     if target.shape[-2:] != pred.shape[-2:]:
         target = nn.functional.interpolate(
             target.reshape(-1, *target.shape[2:]),
@@ -392,7 +410,10 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor, args) -> torch.Tensor
                 target_flat, size=pred_flat.shape[-2:], mode="bilinear", align_corners=False
             )
         lpips_val = lpips_loss_fn(pred_flat, target_flat, pred.device)
-        return l1 + args.lpips_weight * lpips_val
+        loss = l1 + args.lpips_weight * lpips_val
+        if return_rae_components:
+            return loss, (l1.item(), lpips_val.item())
+        return loss
     raise ValueError(f"Unknown loss: {args.loss}")
 
 
@@ -447,14 +468,19 @@ def train_one_decoder(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
-        pin_memory=True,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     eval_loader = DataLoader(
         eval_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     # Infer emb_dim from first sample
@@ -466,6 +492,10 @@ def train_one_decoder(
     print(f"  Inferred emb_dim={emb_dim}")
 
     decoder = VQVAE(emb_dim=emb_dim).to(device)
+    if args.compile and hasattr(torch, "compile"):
+        decoder = torch.compile(decoder, mode="reduce-overhead")
+        print("  Using torch.compile (mode=reduce-overhead)")
+    decoder_for_save = getattr(decoder, "_orig_mod", decoder)
     params = list(decoder.parameters())
     optimizer = AdamW(params, lr=args.lr)
     best_eval = float("inf")
@@ -492,6 +522,12 @@ def train_one_decoder(
     if args.wandb and HAS_WANDB:
         wandb.init(project="dino-decoder-tactile", name=f"decoder_{group_name}")
 
+    use_amp = args.amp and torch.cuda.is_available()
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    non_blocking = torch.cuda.is_available()
+    if use_amp:
+        print("  Using AMP (automatic mixed precision)")
+
     for i in range(args.iters):
         # Refresh loaders when exhausted
         try:
@@ -509,38 +545,39 @@ def train_one_decoder(
         loss_gan_val, loss_disc_val = None, None
         loss_d_per_cam = {}
 
-        for cam in camera_group:
-            embd = data[f"{cam}_embd"].to(device)
-            target = data[f"{cam}_image"].to(device)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            for cam in camera_group:
+                embd = data[f"{cam}_embd"].to(device, non_blocking=non_blocking)
+                target = data[f"{cam}_image"].to(device, non_blocking=non_blocking)
 
-            B, T, N, D = embd.shape
-            embd = ensure_patch_grid(embd, target_side=args.patch_side)
+                B, T, N, D = embd.shape
+                embd = ensure_patch_grid(embd, target_side=args.patch_side)
 
-            pred, _ = decoder(embd)
-            pred = rearrange(pred, "(b t) c h w -> b t c h w", b=B, t=T)
-            target = target.permute(0, 1, 4, 2, 3)  # B T H W C -> B T C H W
-            if target.shape[2] != 3:
-                target = target[:, :, :3]
-            preds_dict[cam] = pred
-            targets_dict[cam] = target
+                pred, _ = decoder(embd)
+                pred = rearrange(pred, "(b t) c h w -> b t c h w", b=B, t=T)
+                target = target.permute(0, 1, 4, 2, 3)  # B T H W C -> B T C H W
+                if target.shape[2] != 3:
+                    target = target[:, :, :3]
+                preds_dict[cam] = pred
+                targets_dict[cam] = target
 
-            loss = compute_loss(pred, target, args)
-            total_loss = total_loss + loss
+                if args.loss == "rae":
+                    loss, (l1_val, lpips_val) = compute_loss(pred, target, args, return_rae_components=True)
+                    loss_l1_sum += l1_val
+                    loss_lpips_sum += lpips_val
+                else:
+                    loss = compute_loss(pred, target, args)
+                total_loss = total_loss + loss
 
+            total_loss = total_loss / len(camera_group)
             if args.loss == "rae":
-                l1, lpips = compute_rae_loss_components(pred, target, args)
-                loss_l1_sum += l1
-                loss_lpips_sum += lpips
+                loss_l1_sum /= len(camera_group)
+                loss_lpips_sum /= len(camera_group)
+            loss_rec = total_loss.item() if args.loss == "rae" else None
 
-        total_loss = total_loss / len(camera_group)
-        loss_rec = total_loss.item() if args.loss == "rae" else None
-        if args.loss == "rae":
-            loss_l1_sum /= len(camera_group)
-            loss_lpips_sum /= len(camera_group)
-
-        # RAE: add adversarial loss with adaptive lambda (paper Sec 3, Table 12)
-        # Per-camera discriminators to prevent mode collapse across different camera modalities
-        if args.loss == "rae" and i >= args.adv_start_iter and discriminators is not None:
+            # RAE: add adversarial loss with adaptive lambda (paper Sec 3, Table 12)
+            # Per-camera discriminators to prevent mode collapse across different camera modalities
+            if args.loss == "rae" and i >= args.adv_start_iter and discriminators is not None:
             total_gan = 0.0
             for cam in camera_group:
                 pred = preds_dict[cam]
@@ -570,8 +607,13 @@ def train_one_decoder(
             loss_gan_val = total_gan.item()
             total_loss = total_loss + args.gan_weight * total_gan
 
-        total_loss.backward()
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            total_loss.backward()
+            optimizer.step()
 
         # RAE: train discriminators (one per camera to prevent mode collapse)
         if args.loss == "rae" and i >= args.disc_start_iter and discriminators is not None:
@@ -602,8 +644,14 @@ def train_one_decoder(
                 loss_d_total = loss_d_total + loss_d_cam
                 loss_d_per_cam[cam] = loss_d_cam.item()
             loss_disc_val = (loss_d_total / len(camera_group)).item()
-            (loss_d_total / len(camera_group)).backward()
-            disc_optimizer.step()
+            loss_d_scaled = loss_d_total / len(camera_group)
+            if scaler is not None:
+                scaler.scale(loss_d_scaled).backward()
+                scaler.step(disc_optimizer)
+                scaler.update()
+            else:
+                loss_d_scaled.backward()
+                disc_optimizer.step()
 
         if args.wandb and HAS_WANDB:
             log_dict = {"train_loss": total_loss.item()}
@@ -638,12 +686,12 @@ def train_one_decoder(
                 eval_data = next(eval_iter)
 
             decoder.eval()
-            with torch.no_grad():
+            with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
                 eval_loss = 0.0
                 log_images = {}
                 for cam in camera_group:
-                    embd = eval_data[f"{cam}_embd"].to(device)
-                    target = eval_data[f"{cam}_image"].to(device)
+                    embd = eval_data[f"{cam}_embd"].to(device, non_blocking=non_blocking)
+                    target = eval_data[f"{cam}_image"].to(device, non_blocking=non_blocking)
                     B, T, N, D = embd.shape
                     embd = ensure_patch_grid(embd, target_side=args.patch_side)
                     pred, _ = decoder(embd)
@@ -660,7 +708,7 @@ def train_one_decoder(
                         log_images[f"eval_{cam}_pred"] = wandb.Image(pred_img, caption=f"{cam} decoded")
                 eval_loss /= len(camera_group)
 
-         in_adv_phase = (
+            in_adv_phase = (
                 args.loss == "rae"
                 and i >= args.adv_start_iter
                 and discriminators is not None
@@ -670,7 +718,7 @@ def train_one_decoder(
                     best_eval_adv = eval_loss
                     os.makedirs(args.output_dir, exist_ok=True)
                     base = f"decoder_{group_name.replace('+', '_')}_adv"
-                    torch.save(decoder.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
+                    torch.save(decoder_for_save.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
                     if discriminators is not None:
                         torch.save(
                             discriminators.state_dict(),
@@ -680,7 +728,7 @@ def train_one_decoder(
                 best_eval = eval_loss
                 os.makedirs(args.output_dir, exist_ok=True)
                 base = f"decoder_{group_name.replace('+', '_')}"
-                torch.save(decoder.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
+                torch.save(decoder_for_save.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
                 if discriminators is not None:
                     torch.save(
                         discriminators.state_dict(),
@@ -690,7 +738,7 @@ def train_one_decoder(
             if i % 5000 == 0:
                 os.makedirs(args.output_dir, exist_ok=True)
                 ckpt_path = os.path.join(args.output_dir, f"decoder_{group_name.replace('+', '_')}_{i}.pth")
-                torch.save(decoder.state_dict(), ckpt_path)
+                torch.save(decoder_for_save.state_dict(), ckpt_path)
                 if discriminators is not None:
                     disc_path = os.path.join(args.output_dir, f"discriminators_{group_name.replace('+', '_')}_{i}.pth")
                     torch.save(discriminators.state_dict(), disc_path)
@@ -712,7 +760,7 @@ def train_one_decoder(
     # Save last checkpoint
     os.makedirs(args.output_dir, exist_ok=True)
     base = f"decoder_{group_name.replace('+', '_')}_last"
-    torch.save(decoder.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
+    torch.save(decoder_for_save.state_dict(), os.path.join(args.output_dir, f"{base}.pth"))
     if discriminators is not None:
         torch.save(
             discriminators.state_dict(),

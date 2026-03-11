@@ -89,6 +89,7 @@ class TactileTrajectoryDataset(Dataset):
         self.num_test = num_test
         self.is_consolidated = is_consolidated
         self.resize_to_224 = resize_to_224
+        self._hf = None  # Lazy-open persistent handle for consolidated mode
 
         for cam in cameras:
             if cam not in CAMERA_CONFIG:
@@ -143,14 +144,27 @@ class TactileTrajectoryDataset(Dataset):
         f = h5py.File(traj_id, "r")
         return f["data"] if "data" in f else f
 
+    def _get_hf(self, file_path: str):
+        """Return open HDF5 file handle. Reuses handle for consolidated mode."""
+        if self.is_consolidated:
+            if self._hf is None:
+                self._hf = h5py.File(file_path, "r")
+            return self._hf
+        return None
+
     def __getitem__(self, idx):
         traj_id, start_idx = self.slice_indices[idx]
         end_idx = start_idx + self.segment_length
 
         file_path = self.hdf5_path if self.is_consolidated else traj_id
-        with h5py.File(file_path, "r") as hf:
-            traj = hf[traj_id] if self.is_consolidated else (hf["data"] if "data" in hf else hf)
+        hf = self._get_hf(file_path)
+        if hf is not None:
+            traj = hf[traj_id]
+        else:
+            hf = h5py.File(file_path, "r")
+            traj = hf["data"] if "data" in hf else hf
 
+        try:
             out = {}
             for cam in self.cameras:
                 cfg = CAMERA_CONFIG[cam]
@@ -181,7 +195,10 @@ class TactileTrajectoryDataset(Dataset):
                     traj["states"][start_idx:end_idx], dtype=torch.float32
                 )
 
-        return out
+            return out
+        finally:
+            if not self.is_consolidated:
+                hf.close()
 
 
 def load_full_episode(

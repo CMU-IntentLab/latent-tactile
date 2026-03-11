@@ -9,9 +9,9 @@ from setuptools import find_packages, setup
 
 def get_version() -> str:
     # https://packaging.python.org/guides/single-sourcing-package-version/
-    init = open(os.path.join("PyHJ", "__init__.py"), "r").read().split()
-    return init[init.index("__version__") + 2][1:-1]
-
+    #init = open(os.path.join("PyHJ", "__init__.py"), "r").read().split()
+    #return init[init.index("__version__") + 2][1:-1]
+    return "0.0.1"
 
 def get_install_requires() -> str:
     return [
