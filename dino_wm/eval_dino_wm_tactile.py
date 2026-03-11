@@ -55,6 +55,14 @@ def ensure_patch_grid(embd: torch.Tensor, target_side: int) -> torch.Tensor:
     return embd
 
 
+def _strip_compile_prefix(state_dict: dict) -> dict:
+    """Remove _orig_mod. prefix from keys when checkpoint was saved with torch.compile."""
+    prefix = "_orig_mod."
+    if not any(k.startswith(prefix) for k in state_dict):
+        return state_dict
+    return {k.replace(prefix, "", 1): v for k, v in state_dict.items()}
+
+
 def _find_decoder_path(decoder_dir: str, base_name: str):
     """Try base, _adv, _last suffixes."""
     for suffix in ("", "_adv", "_last"):
@@ -343,7 +351,8 @@ def main():
         num_frames=H,
         dropout=0.1,
     ).to(device)
-    transition.load_state_dict(torch.load(args.wm_checkpoint, map_location=device))
+    wm_state = torch.load(args.wm_checkpoint, map_location=device)
+    transition.load_state_dict(_strip_compile_prefix(wm_state))
     transition.eval()
 
     # Load decoders
