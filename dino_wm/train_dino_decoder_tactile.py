@@ -396,6 +396,27 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor, args) -> torch.Tensor
     raise ValueError(f"Unknown loss: {args.loss}")
 
 
+def compute_rae_loss_components(pred: torch.Tensor, target: torch.Tensor, args) -> tuple:
+    """Return (l1, lpips) for RAE loss logging."""
+    if target.shape[-2:] != pred.shape[-2:]:
+        target = nn.functional.interpolate(
+            target.reshape(-1, *target.shape[2:]),
+            size=pred.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        target = target.reshape(pred.shape)
+    l1 = nn.L1Loss()(pred, target)
+    pred_flat = pred.reshape(-1, *pred.shape[2:])
+    target_flat = target.reshape(-1, *target.shape[2:])
+    if target_flat.shape[-2:] != pred_flat.shape[-2:]:
+        target_flat = nn.functional.interpolate(
+            target_flat, size=pred_flat.shape[-2:], mode="bilinear", align_corners=False
+        )
+    lpips_val = lpips_loss_fn(pred_flat, target_flat, pred.device)
+    return l1.item(), lpips_val.item()
+
+
 def get_cameras_to_train(args) -> list[list[str]]:
     """Return list of camera groups. Each group is trained together (one decoder per group)."""
     if args.mode == "tactile":
@@ -476,6 +497,8 @@ def train_one_decoder(
         total_loss = 0.0
         preds_dict = {}
         targets_dict = {}
+        loss_l1_sum, loss_lpips_sum = 0.0, 0.0
+        loss_gan_val, loss_disc_val = None, None
 
         for cam in camera_group:
             embd = data[f"{cam}_embd"].to(device)
@@ -495,8 +518,16 @@ def train_one_decoder(
             loss = compute_loss(pred, target, args)
             total_loss = total_loss + loss
 
+            if args.loss == "rae":
+                l1, lpips = compute_rae_loss_components(pred, target, args)
+                loss_l1_sum += l1
+                loss_lpips_sum += lpips
+
         total_loss = total_loss / len(camera_group)
         loss_rec = total_loss.item() if args.loss == "rae" else None
+        if args.loss == "rae":
+            loss_l1_sum /= len(camera_group)
+            loss_lpips_sum /= len(camera_group)
 
         # RAE: add adversarial loss with adaptive lambda (paper Sec 3, Table 12)
         if args.loss == "rae" and i >= args.adv_start_iter and discriminator is not None:
@@ -525,6 +556,7 @@ def train_one_decoder(
                 lam = (grad_rec.norm() / (grad_gan.norm() + 1e-8)).detach().clamp(0.01, 100)
                 total_gan = total_gan + lam * gan_loss_gen
             total_gan = total_gan / len(camera_group)
+            loss_gan_val = total_gan.item()
             total_loss = total_loss + args.gan_weight * total_gan
 
         total_loss.backward()
@@ -554,16 +586,32 @@ def train_one_decoder(
                 loss_d_real = nn.functional.relu(1.0 - real_score).mean()
                 loss_d_fake = nn.functional.relu(1.0 + fake_score).mean()
                 loss_d_total = loss_d_total + loss_d_real + loss_d_fake
+            loss_disc_val = (loss_d_total / len(camera_group)).item()
             (loss_d_total / len(camera_group)).backward()
             disc_optimizer.step()
 
         if args.wandb and HAS_WANDB:
             log_dict = {"train_loss": total_loss.item()}
-            if loss_rec is not None:
-                log_dict["train_loss_rec"] = loss_rec
+            if args.loss == "rae":
+                log_dict["loss_l1"] = loss_l1_sum
+                log_dict["loss_lpips"] = loss_lpips_sum
+                if loss_rec is not None:
+                    log_dict["loss_rec"] = loss_rec
+                if loss_gan_val is not None:
+                    log_dict["loss_gan"] = loss_gan_val
+                if loss_disc_val is not None:
+                    log_dict["loss_disc"] = loss_disc_val
             wandb.log(log_dict)
         if i % 50 == 0:
-            print(f"\r[{group_name}] Iter {i}, Train Loss: {total_loss.item():.4f}", end="", flush=True)
+            parts = [f"Loss: {total_loss.item():.4f}"]
+            if args.loss == "rae":
+                parts.append(f"L1: {loss_l1_sum:.4f}")
+                parts.append(f"LPIPS: {loss_lpips_sum:.4f}")
+                if loss_gan_val is not None:
+                    parts.append(f"GAN: {loss_gan_val:.4f}")
+                if loss_disc_val is not None:
+                    parts.append(f"D: {loss_disc_val:.4f}")
+            print(f"\r[{group_name}] Iter {i}, " + ", ".join(parts), end="", flush=True)
 
         if i % 100 == 0:
             try:
@@ -599,6 +647,11 @@ def train_one_decoder(
                 best_eval = eval_loss
                 os.makedirs(args.output_dir, exist_ok=True)
                 ckpt_path = os.path.join(args.output_dir, f"decoder_{group_name.replace('+', '_')}.pth")
+                torch.save(decoder.state_dict(), ckpt_path)
+            ## also save every 5000 iters 
+            if i % 5000 == 0:
+                os.makedirs(args.output_dir, exist_ok=True)
+                ckpt_path = os.path.join(args.output_dir, f"decoder_{group_name.replace('+', '_')}_{i}.pth")
                 torch.save(decoder.state_dict(), ckpt_path)
 
             if args.wandb and HAS_WANDB:
