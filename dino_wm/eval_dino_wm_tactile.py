@@ -121,31 +121,44 @@ def create_episode_videos(
             continue
 
         T_total = ep_data[f"{predict_cameras[0]}_embd"].shape[0]
-        T = min(T_total, args.max_episode_len)
+        start_idx = 0
+        if args.start_after_gripper_close:
+            raw_actions = np.asarray(ep_data["actions"][:T_total])
+            if raw_actions.shape[-1] <= args.gripper_idx:
+                continue
+            gripper_vals = raw_actions[:, args.gripper_idx]
+            closed_mask = gripper_vals <= args.gripper_closed_threshold
+            closed_indices = np.where(closed_mask)[0]
+            if len(closed_indices) == 0:
+                continue
+            start_idx = int(closed_indices[0])
+            if T_total - start_idx < args.segment_length:
+                continue
+        T = min(T_total - start_idx, args.max_episode_len)
         H = args.segment_length - 1
         if T <= H:
             continue
 
-        # Load GT images
+        # Load GT images (sliced from start_idx)
         all_gt_imgs = []
         for cam in predict_cameras:
-            gt_img = np.asarray(ep_data[f"{cam}_image"][:T], dtype=np.float32)
+            gt_img = np.asarray(ep_data[f"{cam}_image"][start_idx : start_idx + T], dtype=np.float32)
             if gt_img.ndim == 3:
                 gt_img = np.stack([gt_img] * 3, axis=-1)
             if gt_img.max() > 1.0:
                 gt_img = gt_img / 255.0
             all_gt_imgs.append(np.clip(gt_img, 0, 1))
 
-        # Build initial inputs
-        states = torch.tensor(ep_data["states"][:T], dtype=torch.float32, device=device).unsqueeze(0)
-        actions = torch.tensor(ep_data["actions"][:T], dtype=torch.float32, device=device).unsqueeze(0)
+        # Build initial inputs (sliced from start_idx)
+        states = torch.tensor(ep_data["states"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
+        actions = torch.tensor(ep_data["actions"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
         if actions.shape[-1] > 7:
             actions = actions[..., :7]
         actions = normalize_acs(actions, device)
 
         inputs = {}
         for c in condition_cameras:
-            emb = torch.tensor(ep_data[f"{c}_embd"][:T], dtype=torch.float32, device=device).unsqueeze(0)
+            emb = torch.tensor(ep_data[f"{c}_embd"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
             inputs[c] = ensure_patch_grid(emb, PATCH_SIDE_DINOV3)[:, :H]
         inp_states = states[:, :H]
         inp_acs = actions[:, :H]
@@ -172,7 +185,7 @@ def create_episode_videos(
                         inputs[c] = torch.cat([inputs[c][:, 1:], next_embds[c]], dim=1)
                     else:
                         next_gt = torch.tensor(
-                            ep_data[f"{c}_embd"][H + k], dtype=torch.float32, device=device
+                            ep_data[f"{c}_embd"][start_idx + H + k], dtype=torch.float32, device=device
                         ).unsqueeze(0).unsqueeze(0)
                         inputs[c] = torch.cat([inputs[c][:, 1:], ensure_patch_grid(next_gt, PATCH_SIDE_DINOV3)], dim=1)
                 inp_states = torch.cat([inp_states[:, 1:], next_state], dim=1)
@@ -312,6 +325,23 @@ def parse_args():
         type=int,
         default=10,
     )
+    p.add_argument(
+        "--start_after_gripper_close",
+        action="store_true",
+        help="For episode videos, only show frames after the gripper has closed",
+    )
+    p.add_argument(
+        "--gripper_idx",
+        type=int,
+        default=6,
+        help="Action dimension index for gripper (default 6 for 7-dim actions)",
+    )
+    p.add_argument(
+        "--gripper_closed_threshold",
+        type=float,
+        default=-0.5,
+        help="Gripper is closed when action[gripper_idx] <= this (default -0.5 for [-1,1] scale)",
+    )
     return p.parse_args()
 
 
@@ -387,73 +417,73 @@ def main():
         run_name = args.wandb_run_name or f"eval_wm_{'+'.join(cameras)}"
         wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
 
-    with torch.no_grad():
-        for data in tqdm(eval_loader, desc="Evaluating"):
-            # Build inputs: (B, H, N, D) for each condition camera
-            cond_inputs = {}
-            for cam in condition_cameras:
-                embd = data[f"{cam}_embd"].to(device)
-                embd = ensure_patch_grid(embd, PATCH_SIDE_DINOV3)
-                cond_inputs[cam] = embd[:, :-1]
+    # with torch.no_grad():
+    #     for data in tqdm(eval_loader, desc="Evaluating"):
+    #         # Build inputs: (B, H, N, D) for each condition camera
+    #         cond_inputs = {}
+    #         for cam in condition_cameras:
+    #             embd = data[f"{cam}_embd"].to(device)
+    #             embd = ensure_patch_grid(embd, PATCH_SIDE_DINOV3)
+    #             cond_inputs[cam] = embd[:, :-1]
 
-            states = data["state"].to(device)[:, :-1]
-            acs_raw = data["action"].to(device)
-            if acs_raw.shape[-1] > 7:
-                acs_raw = acs_raw[..., :7]
-            acs = normalize_acs(acs_raw, device)[:, :-1]
+    #         states = data["state"].to(device)[:, :-1]
+    #         acs_raw = data["action"].to(device)
+    #         if acs_raw.shape[-1] > 7:
+    #             acs_raw = acs_raw[..., :7]
+    #         acs = normalize_acs(acs_raw, device)[:, :-1]
 
-            preds, pred_state = transition(cond_inputs, states, acs)
+    #         preds, pred_state = transition(cond_inputs, states, acs)
 
-            # Decode predicted next-frame embeddings and compare to GT
-            batch_loss = 0.0
-            preds_per_cam = {}
-            targets_per_cam = {}
-            for cam in predict_cameras:
-                if cam not in decoders:
-                    continue
-                pred_embd = preds[cam][:, -1:]  # (B, 1, N, D)
-                target_embd = data[f"{cam}_embd"].to(device)[:, 1:2]
-                target_img = data[f"{cam}_image"].to(device)[:, 1:2]
-                target_img = target_img.permute(0, 1, 4, 2, 3)
-                if target_img.shape[2] != 3:
-                    target_img = target_img[:, :, :3]
+    #         # Decode predicted next-frame embeddings and compare to GT
+    #         batch_loss = 0.0
+    #         preds_per_cam = {}
+    #         targets_per_cam = {}
+    #         for cam in predict_cameras:
+    #             if cam not in decoders:
+    #                 continue
+    #             pred_embd = preds[cam][:, -1:]  # (B, 1, N, D)
+    #             target_embd = data[f"{cam}_embd"].to(device)[:, 1:2]
+    #             target_img = data[f"{cam}_image"].to(device)[:, 1:2]
+    #             target_img = target_img.permute(0, 1, 4, 2, 3)
+    #             if target_img.shape[2] != 3:
+    #                 target_img = target_img[:, :, :3]
 
-                pred_img, _ = decoders[cam](pred_embd)
-                pred_img = rearrange(pred_img, "(b t) c h w -> b t c h w", t=1)
-                batch_loss += nn.MSELoss()(pred_img, target_img).item()
-                preds_per_cam[cam] = pred_img
-                targets_per_cam[cam] = target_img
+    #             pred_img, _ = decoders[cam](pred_embd)
+    #             pred_img = rearrange(pred_img, "(b t) c h w -> b t c h w", t=1)
+    #             batch_loss += nn.MSELoss()(pred_img, target_img).item()
+    #             preds_per_cam[cam] = pred_img
+    #             targets_per_cam[cam] = target_img
 
-            batch_loss /= len([c for c in predict_cameras if c in decoders])
-            total_loss += batch_loss
-            n_batches += 1
+    #         batch_loss /= len([c for c in predict_cameras if c in decoders])
+    #         total_loss += batch_loss
+    #         n_batches += 1
 
-            if (args.output_dir or wandb_images is not None) and samples_saved < args.num_samples:
-                B = pred_img.shape[0]
-                if args.output_dir:
-                    os.makedirs(args.output_dir, exist_ok=True)
-                for i in range(min(B, args.num_samples - samples_saved)):
-                    for cam in predict_cameras:
-                        if cam not in preds_per_cam:
-                            continue
-                        gt = targets_per_cam[cam][i, 0].clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
-                        pred_img_np = preds_per_cam[cam][i, 0].clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
-                        if args.output_dir:
-                            gt_path = os.path.join(args.output_dir, f"sample_{samples_saved}_{cam}_gt.png")
-                            pred_path = os.path.join(args.output_dir, f"sample_{samples_saved}_{cam}_pred.png")
-                            Image.fromarray((gt * 255).astype(np.uint8)).save(gt_path)
-                            Image.fromarray((pred_img_np * 255).astype(np.uint8)).save(pred_path)
-                        if wandb_images is not None and samples_saved == 0:
-                            wandb_images[f"eval_{cam}_gt"] = wandb.Image(gt, caption=f"{cam} ground truth")
-                            wandb_images[f"eval_{cam}_pred"] = wandb.Image(pred_img_np, caption=f"{cam} predicted")
-                    samples_saved += 1
-                    if samples_saved >= args.num_samples:
-                        break
+    #         if (args.output_dir or wandb_images is not None) and samples_saved < args.num_samples:
+    #             B = pred_img.shape[0]
+    #             if args.output_dir:
+    #                 os.makedirs(args.output_dir, exist_ok=True)
+    #             for i in range(min(B, args.num_samples - samples_saved)):
+    #                 for cam in predict_cameras:
+    #                     if cam not in preds_per_cam:
+    #                         continue
+    #                     gt = targets_per_cam[cam][i, 0].clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
+    #                     pred_img_np = preds_per_cam[cam][i, 0].clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
+    #                     if args.output_dir:
+    #                         gt_path = os.path.join(args.output_dir, f"sample_{samples_saved}_{cam}_gt.png")
+    #                         pred_path = os.path.join(args.output_dir, f"sample_{samples_saved}_{cam}_pred.png")
+    #                         Image.fromarray((gt * 255).astype(np.uint8)).save(gt_path)
+    #                         Image.fromarray((pred_img_np * 255).astype(np.uint8)).save(pred_path)
+    #                     if wandb_images is not None and samples_saved == 0:
+    #                         wandb_images[f"eval_{cam}_gt"] = wandb.Image(gt, caption=f"{cam} ground truth")
+    #                         wandb_images[f"eval_{cam}_pred"] = wandb.Image(pred_img_np, caption=f"{cam} predicted")
+    #                 samples_saved += 1
+    #                 if samples_saved >= args.num_samples:
+    #                     break
 
-    mean_loss = total_loss / n_batches if n_batches > 0 else 0.0
-    print(f"\nTest MSE Loss (1-step pred, decoded): {mean_loss:.6f}")
-    if args.output_dir:
-        print(f"Saved {samples_saved} sample images to {args.output_dir}")
+    # mean_loss = total_loss / n_batches if n_batches > 0 else 0.0
+    # print(f"\nTest MSE Loss (1-step pred, decoded): {mean_loss:.6f}")
+    # if args.output_dir:
+    #     print(f"Saved {samples_saved} sample images to {args.output_dir}")
 
     # Episode rollout videos
     if args.wandb and HAS_WANDB and args.num_episode_videos > 0:
