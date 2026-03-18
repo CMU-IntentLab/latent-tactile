@@ -14,31 +14,9 @@ from torchvision import transforms
 import torchvision.transforms.functional as F
 from scipy.spatial.transform import Rotation as R
 # Image transforms
-
-def crop_top_middle(image):
-    top = 30
-    left = 46
-    height = 180
-    width = 180
-    return F.crop(image, top, left, height, width)
+import json
 
 
-
-#front cam transforms
-crop_transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Lambda(lambda img: crop_top_middle(img)),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
-])
-DINO_crop = transforms.Compose([
-    transforms.GaussianBlur(kernel_size=(5, 5), sigma=(0.1, 0.1)),
-    transforms.Lambda(lambda img: crop_top_middle(img)),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
 
 #wrist cam transforms
 resize_transform = transforms.Compose([
@@ -60,10 +38,7 @@ def resize_images_to_224(images, key):
     resized = []
     for i in range(len(images)):
         img = images[i]
-        if key == "camera_0":  # wrist camera
-            img_tensor = resize_transform(img.astype(np.uint8))
-        else:
-            img_tensor = crop_transform(img.astype(np.uint8))
+        img_tensor = resize_transform(img.astype(np.uint8))
         resized.append(img_tensor.numpy().transpose(1, 2, 0))  # back to HWC
     return np.stack(resized)
 
@@ -81,14 +56,29 @@ def eef_pose_to_state(T, gripper):
     return eef_state
 
 
-def preprocess(demo_path):
+def preprocess(demo_path, output_json_file):
     # Load DINO model
     dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg').to('cuda:0')
+    print('loaded dinov2')
+    
+    # Choose the model variant you want, e.g., ViT-S/16
+    '''dino = torch.hub.load(
+        "/home/intent/Projects/dinov3",
+        'dinov3_vits16plus',
+        source='local',
+        weights='/home/intent/Projects/latent-cbf/dinov3_vit16plus.pth'
+    )
+    print('loaded dinov3')'''
+    
 
+    dino = dino.to('cuda:0')
+    dino.eval()
+    
+
+    
+    
     # Path to HDF5 files
     hdf5_files = [os.path.join(demo_path, f) for f in os.listdir(demo_path) if f.endswith('.hdf5')]
-
-    pixel_keys = ["rs", "zed_right"]
 
     all_acs = []
     transitions = 0
@@ -99,7 +89,10 @@ def preprocess(demo_path):
             if "camera_0" not in data_group or "camera_1" not in data_group:
                 print(f"Skipping {hdf5_file} due to missing camera data.")
                 continue
-            actions = data_group["actions"][:]
+            if "actions" in data_group:
+                actions = data_group["actions"][:]
+            else:
+                actions = data_group["action"][:]
             cam_rs = data_group["camera_0"][:]
             cam_zed = data_group["camera_1"][:]
             
@@ -123,7 +116,7 @@ def preprocess(demo_path):
                     # Zed front image
                     zed_img = cam_zed[t]
                     img_PIL = Image.fromarray(np.uint8(zed_img)).convert('RGB')
-                    img_tensor = DINO_crop(img_PIL).to('cuda:0')
+                    img_tensor = DINO_transform(img_PIL).to('cuda:0')
                     with torch.no_grad():
                         patch_emb = dino.forward_features(img_tensor.unsqueeze(0))['x_norm_patchtokens'].squeeze().cpu().numpy()
                     cam_zed_embds.append(patch_emb)
@@ -140,6 +133,8 @@ def preprocess(demo_path):
                 data_group.create_dataset("cam_zed_embd", data=np.stack(cam_zed_embds))
             if "states" not in data_group:
                 data_group.create_dataset("states", data=np.stack(states))
+            if "actions" not in data_group:
+                data_group.create_dataset("actions", data=np.stack(actions))
             all_acs.extend(actions)
             transitions += len(actions)
 
@@ -147,7 +142,16 @@ def preprocess(demo_path):
     all_acs = np.array(all_acs)
     print('max', np.max(all_acs, axis=0))
     print('min', np.min(all_acs, axis=0))
+    print('mean', np.mean(all_acs, axis=0)) 
+    print('std', np.std(all_acs, axis=0))
     print('total transitions:', transitions)
+    max_acs, min_acs, total_transitions, num_trajs = np.max(all_acs, axis=0), np.min(all_acs, axis=0), transitions, i+1
+    mean_acs = np.mean(all_acs, axis=0)
+    std_acs = np.std(all_acs, axis=0)
+    info = {'max_acs': max_acs.tolist(), 'min_acs': min_acs.tolist(), 'mean_acs': mean_acs.tolist(), 'std_acs':std_acs.tolist(), 'num_transitions': int(total_transitions), 'num_trajectories': int(num_trajs)}
+    with open(output_json_file, "w") as f:
+        json.dump(info, f)  # indent=4 makes it pretty-printed
+
 
 
 def convert_hdf5_to_consolidated_hdf5(hdf5_dir, output_hdf5_file):
@@ -176,6 +180,10 @@ def convert_hdf5_to_consolidated_hdf5(hdf5_dir, output_hdf5_file):
                         #    print(file_path, "labels and camera_0 length mismatch")
                         #    continue
                         # Copy datasets
+                        if "camera_0" not in data_group or "camera_1" not in data_group:
+                            # edge case where one of the cameras stopped recording
+                            print(file_path, "camera_0 or camera_1 not found")
+                            continue
                         for key in data_group.keys():
                             #if key == 'labels':
                             #    assert data_group[key].shape[0] == data_group['camera_0'].shape[0] 
@@ -192,7 +200,8 @@ def convert_hdf5_to_consolidated_hdf5(hdf5_dir, output_hdf5_file):
                 print(f"Copied {hdf5_file} → trajectory_{i}")
 
 if __name__ == '__main__':
-    hdf5_dir = "/data/ken/latent-labeled"
-    output_hdf5_file = "/data/ken/latent-labeled/consolidated.h5"
-    preprocess(hdf5_dir)
+    hdf5_dir = "/data/mobile/train_labeled/"
+    output_hdf5_file = hdf5_dir + "buffer_v2.h5"
+    output_json_file = hdf5_dir + "info.json"
+    preprocess(hdf5_dir, output_json_file)
     convert_hdf5_to_consolidated_hdf5(hdf5_dir, output_hdf5_file)

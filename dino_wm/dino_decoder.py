@@ -226,3 +226,62 @@ class VQVAE(nn.Module):
         quant_b = quant_b.permute(0, 3, 1, 2)
         dec = self.decode(quant_b)
         return dec
+
+
+class ViTImageDecoder(nn.Module):
+    """ViT MAE-style decoder: patch tokens → reconstructed image.
+
+    Drop-in replacement for VQVAE — same forward signature.
+    Input:  (B, T, num_patches, emb_dim)   e.g. (B, 1, 256, 384)
+    Output: (B*T, C, H, W), dummy_loss      e.g. (B*T, 3, 224, 224)
+    """
+
+    def __init__(
+        self,
+        hidden_size=384,
+        decoder_hidden_size=384,
+        decoder_num_hidden_layers=6,
+        decoder_num_attention_heads=8,
+        decoder_intermediate_size=2048,
+        patch_size=14,
+        image_size=224,
+        num_channels=3,
+    ):
+        super().__init__()
+        try:
+            from dino_wm.utils import ViTMAEConfig
+        except ImportError:
+            from utils import ViTMAEConfig
+        try:
+            from dino_wm.decoder import GeneralDecoder
+        except ImportError:
+            from decoder import GeneralDecoder
+
+        config = ViTMAEConfig(
+            hidden_size=hidden_size,
+            decoder_hidden_size=decoder_hidden_size,
+            decoder_num_hidden_layers=decoder_num_hidden_layers,
+            decoder_num_attention_heads=decoder_num_attention_heads,
+            decoder_intermediate_size=decoder_intermediate_size,
+            patch_size=patch_size,
+            image_size=image_size,
+            num_channels=num_channels,
+        )
+        num_patches = (image_size // patch_size) ** 2
+        self.dec = GeneralDecoder(config, num_patches)
+        self.config = config
+
+    def forward(self, input):
+        """
+        input: (B, T, num_patches, emb_dim)
+        returns: decoded_images (B*T, C, H, W), dummy_loss
+        """
+        b, t, n, d = input.shape
+        x = rearrange(input, "b t n d -> (b t) n d")
+        output = self.dec(x)
+        logits = output.logits
+        images = self.dec.unpatchify(logits)
+        return images, torch.zeros(1, device=input.device)
+
+    def get_last_layer(self):
+        return self.dec.decoder_pred.weight

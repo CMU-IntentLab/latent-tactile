@@ -50,19 +50,46 @@ def batch_rotvec_to_quat(rotvecs):
     quaternions = r.as_quat()
     return quaternions
 
-def normalize_acs(acs, device='cuda:0'):
-    max_ac = torch.tensor([0.89928758, 0.71893158, 0.69869383, 0.32456627, 0.51343921, 0.28401476, 1.        ]).to(device)
-    min_ac = torch.tensor([-0.78933347, -1.         ,-0.95038878, -0.3243517,  -0.30636792, -0.30071826 ,-1.        ]).to(device)
-    
-    norm_acs = (acs - min_ac) / (max_ac - min_ac)
+def normalize_acs(acs, info, device='cuda:0', mode='normal'):
+    if mode == 'minmax':
+        max_ac = torch.tensor(info['max_acs']).to(device)
+        min_ac = torch.tensor(info['min_acs']).to(device)
+
+        # Normalize to -1 to 1
+        norm_acs = 2 * ((acs - min_ac) / (max_ac - min_ac)) - 1
+
+    elif mode == 'normal':
+        mean_ac = torch.tensor(info['mean_acs']).to(device)
+        std_ac = torch.tensor(info['std_acs']).to(device)
+
+        norm_acs = acs.clone()
+        # Normalize only first 6 elements
+        norm_acs[..., :6] = (acs[...,  :6] - mean_ac[:6]) / std_ac[:6]
+
+    else:
+        raise Exception("mode must be 'minmax' or 'normal'")
     
     return norm_acs
 
-def unnormalize_acs(acs, device='cuda:0'):
-    max_ac = torch.tensor([0.89928758, 0.71893158, 0.69869383, 0.32456627, 0.51343921, 0.28401476, 1.        ]).to(device)
-    min_ac = torch.tensor([-0.78933347, -1.         ,-0.95038878, -0.3243517,  -0.30636792, -0.30071826 ,-1.        ]).to(device)
-    
-    acs = (acs*(max_ac - min_ac)) + min_ac
+def unnormalize_acs(norm_acs, info, device='cuda:0', mode='normal'):
+    if mode == 'minmax':
+        max_ac = torch.tensor(info['max_acs']).to(device)
+        min_ac = torch.tensor(info['min_acs']).to(device)
+
+        # -1 to 1 scaling to original range
+        acs = (norm_acs + 1) / 2
+        acs = acs * (max_ac - min_ac) + min_ac
+
+    elif mode == 'normal':
+        mean_ac = torch.tensor(info['mean_acs']).to(device)
+        std_ac = torch.tensor(info['std_acs']).to(device)
+
+        acs = norm_acs.clone()
+        # Unnormalize only first 6 elements
+        acs[...,  :6] = acs[...,  :6] * std_ac[:6] + mean_ac[:6]
+
+    else:
+        raise Exception("mode must be 'minmax' or 'normal'")
     
     return acs
 
