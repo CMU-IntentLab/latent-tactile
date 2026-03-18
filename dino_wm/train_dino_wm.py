@@ -1,268 +1,260 @@
+import math
+import copy
 import numpy as np
 import torch
 import random
 import wandb
 from torch.utils.data import DataLoader
-from torchvision import transforms
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torch import nn
 from einops import rearrange
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from test_loader import SplitTrajectoryDataset
-from dino_decoder import VQVAE
+from dino_decoder import ViTImageDecoder
 from dino_models import VideoTransformer, normalize_acs
+from config import Args
+import tyro
+import json
+import dataclasses
 
-dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
 
+    @torch.no_grad()
+    def update(self, model):
+        for s_param, m_param in zip(self.shadow.parameters(), model.parameters()):
+            s_param.data.mul_(self.decay).add_(m_param.data, alpha=1.0 - self.decay)
 
-transform = transforms.Compose([           
-                                transforms.Resize(256),                    
-                                transforms.CenterCrop(224),               
-                                transforms.ToTensor(),                    
-                                transforms.Normalize(                      
-                                mean=[0.485, 0.456, 0.406],                
-                                std=[0.229, 0.224, 0.225]              
-                                )])
+    def state_dict(self):
+        return self.shadow.state_dict()
 
+    def load_state_dict(self, state_dict):
+        self.shadow.load_state_dict(state_dict)
 
-DINO_transform = transforms.Compose([           
-                            transforms.Resize(224),
-                            
-                            transforms.ToTensor(),])
-norm_transform = transforms.Normalize(                      
-                                mean=[0.485, 0.456, 0.406],                
-                                std=[0.229, 0.224, 0.225]              
-                                )
-
-if __name__ == "__main__":
-    wandb.init(project="dino-WM",
-               name="WM")
-
-    use_amp = True
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    torch.manual_seed(0)
-    torch.cuda.manual_seed(0)
-    random.seed(0)
-    np.random.seed(0)
+    def __call__(self, *args, **kwargs):
+        return self.shadow(*args, **kwargs)
 
 
-    BS = 16
-    BL= 4
-    EVAL_H = 16
-    H = 3
+def eval_openloop(transition, decoder, img_dataloader, info, args):
+    h = args.history_len
+    eval_h = args.eval_len
+    eval_data = next(img_dataloader)
+    with torch.no_grad():
+        eval_data1 = eval_data['cam_zed_embd'].to(args.device)
+        img_in1 = eval_data1[[0], :h].to(args.device)
 
-    hdf5_file = '/data/vlog/consolidated.h5'
-    hdf5_file_test = '/data/vlog-test/consolidated.h5'
+        eval_data2 =  eval_data['cam_rs_embd'].to(args.device)
+        img_in2 = eval_data2[[0], :h].to(args.device)
 
-    expert_data = SplitTrajectoryDataset(hdf5_file, BL, split='train', num_test=0)
-    expert_data_eval = SplitTrajectoryDataset(hdf5_file_test, BL, split='test', num_test=467)
-    expert_data_imagine = SplitTrajectoryDataset(hdf5_file_test, 32, split='test', num_test=467)
+        img_all_acs = eval_data['action'][[0]].to(args.device)
+        img_all_acs = normalize_acs(img_all_acs, info, args.device)
 
-    expert_loader = iter(DataLoader(expert_data, batch_size=BS, shuffle=True))
-    expert_loader_eval = iter(DataLoader(expert_data_eval, batch_size=BS, shuffle=True))
-    expert_loader_imagine = iter(DataLoader(expert_data_imagine, batch_size=1, shuffle=True))
+        img_acs = eval_data['action'][[0],:h].to(args.device)
+        img_acs = normalize_acs(img_acs, info, args.device)
 
-    device = 'cuda:0'
-   
-    decoder = VQVAE().to(device)
-    decoder.load_state_dict(torch.load('checkpoints/testing_decoder.pth'))
-    decoder.eval()
+        img_in_state = eval_data['state'][[0],:h].to(args.device)
+        img_im1s = eval_data['agentview_image'][[0], :h].squeeze().to(args.device)/255.
+        img_im2s = eval_data['robot0_eye_in_hand_image'][[0], :h].squeeze().to(args.device)/255.
+        for k in range(eval_h-h):
+            pred1, pred2, pred_state, _ = transition(img_in1, img_in2, img_in_state, img_acs)
+
+            pred_latent = torch.cat([pred1[:,[-1]], pred2[:,[-1]]], dim=0)#.squeeze()
+            pred_ims, _ = decoder(pred_latent)
+            pred_ims = pred_ims.clamp(0, 1)
+
+            pred_ims = rearrange(pred_ims, "(b t) c h w -> b t h w c", t=1)
+            pred_im1, pred_im2 = torch.split(pred_ims, [img_in1.shape[0], img_in2.shape[0]], dim=0)
+
+            
+            img_im1s = torch.cat([img_im1s, pred_im1.squeeze(0)], dim=0)
+            img_im2s = torch.cat([img_im2s, pred_im2.squeeze(0)], dim=0)
+
+            # getting next inputs
+            img_acs = torch.cat([img_acs[[0], 1:], img_all_acs[0,h+k].unsqueeze(0).unsqueeze(0)], dim=1)
+            img_in1 = torch.cat([img_in1[[0], 1:], pred1[:, -1].unsqueeze(1)], dim=1)
+            img_in2 = torch.cat([img_in2[[0], 1:], pred2[:, -1].unsqueeze(1)], dim=1)
+            img_in_state = torch.cat([img_in_state[[0], 1:], pred_state[:,-1].unsqueeze(1)], dim=1)
+
+        gt_im1 = eval_data['agentview_image'][[0], :eval_h].squeeze().to(args.device)
+        gt_im2 = eval_data['robot0_eye_in_hand_image'][[0], :eval_h].squeeze().to(args.device)
+
+        gt_imgs = torch.cat([gt_im1, gt_im2], dim=-2)/255.
+        pred_imgs = torch.cat([img_im1s, img_im2s], dim=-2)
+        vid = torch.cat([gt_imgs, pred_imgs], dim=-3)
+        vid = vid.detach().cpu().numpy()
+        vid = (vid * 255).clip(0, 255).astype(np.uint8)
+        vid = rearrange(vid, "t h w c -> t c h w")
+        wandb.log({"video": wandb.Video(vid, fps=20, format='mp4')})
+def get_data(dataloader, info, device, image = False):
+    data = next(dataloader)
+    data1 = data['cam_zed_embd'].to(device)
+    in1 = data1[:, :-1]
+    out1 = data1[:, 1:]
+
+    data2 =  data['cam_rs_embd'].to(device)
+    in2 = data2[:, :-1]
+    out2 = data2[:, 1:]
+
+    data_state = data['state'].to(device)
+    in_state = data_state[:, :-1]
+    out_state = data_state[:, 1:]
+
+    data_acs = data['action'].to(device)
+    norm_acs = normalize_acs(data_acs, info, device)
+    acs = norm_acs[:, :-1]
+
+    if image:
+        im1 = data['agentview_image']/255.
+        im2 = data['robot0_eye_in_hand_image']/255.
+        return in1, out1, in2, out2, in_state, out_state, acs, im1, im2
+    return in1, out1, in2, out2, in_state, out_state, acs
+def eval_tf(transition, decoder, eval_dataloader, info, args):
+    h = args.history_len
+    with torch.no_grad():
+        in1, out1, in2, out2, in_state, out_state, acs, img1, img2 = get_data(eval_dataloader, info, args.device, image=True)
+        pred1, pred2, pred_state, _ = transition(in1, in2, in_state, acs)
+        pred_latent = torch.cat([pred1[:,[h-1]], pred2[:,[h-1]]], dim=0) # h-1 idx predicts timestep h
+        pred_ims, _ = decoder(pred_latent)
+        pred_ims = pred_ims.clamp(0, 1)
+        pred_im1, pred_im2 = torch.split(pred_ims, [in1.shape[0], in2.shape[0]], dim=0)
+        pred_im1 = pred_im1[0].permute(1,2,0).detach().cpu().numpy()
+        pred_im2 = pred_im2[0].permute(1,2,0).detach().cpu().numpy()
+        
+        im1_loss = nn.MSELoss()(pred1, out1)
+        im2_loss = nn.MSELoss()(pred2, out2)
+        state_loss = nn.MSELoss()(pred_state, out_state)
+        loss = im1_loss + im2_loss + state_loss
+    img1 = img1[0, h].detach().cpu().numpy()
+    img2 = img2[0, h].detach().cpu().numpy()
+    wandb.log({'eval_loss': loss.item(), 'front_loss': im1_loss.item(), 'wrist_loss': im2_loss.item(), 'state_loss': state_loss.item(), 'pred_front': wandb.Image(pred_im1), 'pred_wrist': wandb.Image(pred_im2), 'front': wandb.Image(img1), 'wrist': wandb.Image(img2)})
+    return loss, im1_loss, im2_loss, state_loss
+    
+
+def train_tf(wm, opt, scaler, loader, info, args):
+    in1, out1, in2, out2, in_state, out_state, acs = get_data(loader, info, args.device)
+    opt.zero_grad()
+    # teacher forcing loss
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.use_amp):
+        pred1, pred2, pred_state, _ = wm(in1, in2, in_state, acs)
+        im1_loss_tf = nn.MSELoss()(pred1, out1)
+        im2_loss_tf = nn.MSELoss()(pred2, out2)
+        state_loss_tf = nn.MSELoss()(pred_state, out_state)
+        loss_tf = im1_loss_tf + im2_loss_tf + state_loss_tf
+    loss = loss_tf
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)
+    torch.nn.utils.clip_grad_norm_(wm.parameters(), max_norm=1.0)
+    scaler.step(opt)
+    scaler.update()
+    wandb.log({'train_loss': loss_tf, 'lr': opt.param_groups[0]['lr']})
+    return loss_tf.item(), im1_loss_tf.item(), im2_loss_tf.item(), state_loss_tf.item()
+    
+def main(args):
+    wandb.init(project=args.proj_name,
+               name=args.exp_name, config=dataclasses.asdict(args))
+    
 
     
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    info = json.load(open(args.info_dir, 'r'))
+    expert_data = SplitTrajectoryDataset(args.train_dir, args.batch_len,  num_test=0, provide_labels=False)
+    expert_data_eval = SplitTrajectoryDataset(args.val_dir, args.batch_len, num_test=0, provide_labels=False)
+    expert_data_imagine = SplitTrajectoryDataset(args.val_dir, args.img_len, num_test=0, provide_labels=False)
+    print(len(expert_data), len(expert_data_eval), len(expert_data_imagine) )
+    expert_loader = iter(DataLoader(expert_data, batch_size=args.batch_size, shuffle=True))
+    expert_loader_eval = iter(DataLoader(expert_data_eval, batch_size=args.batch_size, shuffle=True))
+    expert_loader_imagine = iter(DataLoader(expert_data_imagine, batch_size=1, shuffle=True))
+
+    decoder = ViTImageDecoder().to(args.device)
+    decoder.load_state_dict(torch.load(args.decoder_dir))
+    decoder.eval()
+    
     transition = VideoTransformer(
-        image_size=(224, 224),
-        dim=384,  # DINO feature dimension
-        ac_dim=10,  # Action embedding dimension
-        state_dim=8,  # State dimension
-        depth=6,
-        heads=16,
-        mlp_dim=2048,
-        num_frames=BL-1,
-        dropout=0.1
-    ).to(device)
+        image_size=(args.img_size, args.img_size),
+        dim=args.dim,  # DINO feature dimension
+        ac_dim=args.ac_dim,  # Action embedding dimension
+        state_dim=args.state_dim,  # State dimension
+        depth=args.depth,
+        heads=args.heads,
+        mlp_dim=args.mlp_dim,
+        num_frames=args.batch_len-1,
+        dropout=args.dropout,
+    ).to(args.device)
+    #transition.load_state_dict(torch.load('/data/mobile/dinowm/testing_iter2000.pth'))
+    #transition.load_state_dict(torch.load('/data/ken/dinowm_cbf/testing_iter50000.pth'))
+    transition.failure_head.requires_grad_(False)
     transition.train()
     # Forward pass
     optimizer = AdamW([
-        {'params': transition.transformer.parameters(), 'lr': 5e-5},
-        {'params': transition.state_head.parameters(), 'lr': 5e-5}, 
-        {'params': transition.front_head.parameters(), 'lr': 5e-5}, 
-        {'params': transition.wrist_head.parameters(), 'lr': 5e-5}, 
-        {'params': transition.action_encoder.parameters(), 'lr': 5e-4},
-        {'params': [transition.pos_embedding], 'lr': 5e-4},
-        {'params': [transition.temp_embedding], 'lr': 5e-4}
+        {'params': transition.transformer.parameters(), 'lr': args.base_lr},
+        {'params': transition.state_head.parameters(), 'lr': args.base_lr}, 
+        {'params': transition.front_head.parameters(), 'lr': args.base_lr}, 
+        {'params': transition.wrist_head.parameters(), 'lr': args.base_lr}, 
+        {'params': transition.action_encoder.parameters(), 'lr': args.embd_lr},
+        {'params': [transition.pos_embedding], 'lr': args.embd_lr},
+        {'params': [transition.temp_embedding], 'lr': args.embd_lr}
     ])
+    scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
+    ema = EMA(transition, decay=0.999)
+
+    warmup_steps = 1000
+    min_lr_ratio = 0.1
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        progress = (step - warmup_steps) / max(1, args.train_iter - warmup_steps)
+        return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
 
     best_eval = float('inf')
-    iters = []
-    train_iter = 100000
 
-    for i in tqdm(range(train_iter), desc="Training", unit="iter"):
+    for i in tqdm(range(args.train_iter), desc="Training", unit="iter"):
         if i % len(expert_loader) == 0:
-            expert_loader = iter(DataLoader(expert_data, batch_size=BS, shuffle=True))
+            expert_loader = iter(DataLoader(expert_data, batch_size=args.batch_size, shuffle=True))
         if i % len(expert_loader_eval) == 0:
-            expert_loader_eval = iter(DataLoader(expert_data_eval, batch_size=BS, shuffle=True))
+            expert_loader_eval = iter(DataLoader(expert_data_eval, batch_size=args.batch_size, shuffle=True))
         if i % len(expert_loader_imagine) == 0:
             expert_loader_imagine = iter(DataLoader(expert_data_imagine, batch_size=1, shuffle=True))
 
-        data = next(expert_loader)
+        loss_tf, im1_loss_tf, im2_loss_tf, state_loss_tf = train_tf(transition, optimizer, scaler, expert_loader, info, args)
+        scheduler.step()
+        ema.update(transition)
+        print(f"\rIter {i}, TF Loss: {loss_tf:.4f}, front Loss: {im1_loss_tf:.4f}, wrist Loss: {im2_loss_tf:.4f}, state Loss: {state_loss_tf:.4f}", end='', flush=True)
 
-
-        data1 = data['cam_zed_embd'].to(device)
-        inputs1 = data1[:, :-1]
-        output1 = data1[:, 1:]
-
-        data2 =  data['cam_rs_embd'].to(device)
-        inputs2 = data2[:, :-1]
-        output2 = data2[:, 1:]
-
-        data_state = data['state'].to(device)
-        inputs_states = data_state[:, :-1]
-        output_state = data_state[:, 1:]
-
-        data_acs = data['action'].to(device)
-        norm_acs = normalize_acs(data_acs, device)
-        acs = norm_acs[:, :-1]
-
-        
-        optimizer.zero_grad()
-
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            pred1, pred2, pred_state, _ = transition(inputs1, inputs2, inputs_states, acs)
-            im1_loss_tf = nn.MSELoss()(pred1, output1)
-            im2_loss_tf = nn.MSELoss()(pred2, output2)
-            state_loss_tf = nn.MSELoss()(pred_state, output_state)
-            loss_tf = im1_loss_tf + im2_loss_tf + state_loss_tf
-
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-            detach_pred1 = pred1
-            detach_pred2 = pred2
-            detach_pred_state = pred_state.detach()
-            inputs1_ar = torch.cat([data1[:, [0]], detach_pred1[:, [0]]], dim=1)
-            inputs2_ar = torch.cat([data2[:, [0]], detach_pred2[:, [0]]], dim=1)
-            states_ar = torch.cat([data_state[:,[0]], detach_pred_state[:, [0]]], dim=1)
-            acs_ar = norm_acs[:, [0,1]]
-
-            pred1_ar, pred2_ar, pred_state_ar, _ = transition(inputs1_ar, inputs2_ar, states_ar, acs_ar)
-            output1_ar = data1[:, 2]
-            output2_ar = data2[:, 2]
-            output_state_ar = data_state[:, 2]
-            im1_loss_ar = nn.MSELoss()(pred1_ar[:,1], output1_ar)
-            im2_loss_ar = nn.MSELoss()(pred2_ar[:,1], output2_ar)
-            state_loss_ar = nn.MSELoss()(pred_state_ar[:,1], output_state_ar)
-            loss_ar = im1_loss_ar + im2_loss_ar + state_loss_ar       
-
-        loss = loss_tf + loss_ar*0.5
-        #loss = loss_tf
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        train_loss = loss.item()
-        print(f"\rIter {i}, TF Loss: {loss_tf:.4f}, AR loss:{loss_ar} front Loss: {im1_loss_tf.item():.4f}, wrist Loss: {im2_loss_tf.item():.4f}, state Loss: {state_loss_tf.item():.4f}", end='', flush=True)
-        print(f"\rIter {i}, TF Loss: {loss_tf:.4f}, front Loss: {im1_loss_tf.item():.4f}, wrist Loss: {im2_loss_tf.item():.4f}, state Loss: {state_loss_tf.item():.4f}", end='', flush=True)
-        wandb.log({'train_loss': loss_tf, "train_loss_ar": loss_ar})
-        # eval
-        if (i) % 1000 == 0:
-            iters.append(i)
-            eval_data = next(expert_loader_imagine)
-            transition.eval()
-            with torch.no_grad():
-                eval_data1 = eval_data['cam_zed_embd'].to(device)
-                inputs1 = eval_data1[[0], :H].to(device)
-
-                eval_data2 =  eval_data['cam_rs_embd'].to(device)
-                inputs2 = eval_data2[[0], :H].to(device)
-                
-                all_acs = eval_data['action'][[0]].to(device)
-                all_acs = normalize_acs(all_acs, device)
-                
-                acs = eval_data['action'][[0],:H].to(device)
-                acs = normalize_acs(acs, device)
-
-                inputs_states = eval_data['state'][[0],:H].to(device)
-                im1s = eval_data['agentview_image'][[0], :H].squeeze().to(device)/255.
-                im2s = eval_data['robot0_eye_in_hand_image'][[0], :H].squeeze().to(device)/255.
-                for k in range(EVAL_H-H):
-                    pred1, pred2, pred_state, _ = transition(inputs1, inputs2, inputs_states, acs)
-
-                    pred_latent = torch.cat([pred1[:,[-1]], pred2[:,[-1]]], dim=0)#.squeeze()
-                    pred_ims, _ = decoder(pred_latent)
-
-                    pred_ims = rearrange(pred_ims, "(b t) c h w -> b t h w c", t=1)
-                    pred_im1, pred_im2 = torch.split(pred_ims, [inputs1.shape[0], inputs2.shape[0]], dim=0)
-
-                    
-                    im1s = torch.cat([im1s, pred_im1.squeeze(0)], dim=0)
-                    im2s = torch.cat([im2s, pred_im2.squeeze(0)], dim=0)
-                    
-                    
-                    # getting next inputs
-                    acs = torch.cat([acs[[0], 1:], all_acs[0,H+k].unsqueeze(0).unsqueeze(0)], dim=1)
-                    inputs1 = torch.cat([inputs1[[0], 1:], pred1[:, -1].unsqueeze(1)], dim=1)
-                    inputs2 = torch.cat([inputs2[[0], 1:], pred2[:, -1].unsqueeze(1)], dim=1)
-                    states = torch.cat([inputs_states[[0], 1:], pred_state[:,-1].unsqueeze(1)], dim=1)
-
-                    
-                gt_im1 = eval_data['agentview_image'][[0], :EVAL_H].squeeze().to(device)
-                gt_im2 = eval_data['robot0_eye_in_hand_image'][[0], :EVAL_H].squeeze().to(device)
-
-                gt_imgs = torch.cat([gt_im1, gt_im2], dim=-2)/255.
-                pred_imgs = torch.cat([im1s, im2s], dim=-2)
-                vid = torch.cat([gt_imgs, pred_imgs], dim=-3)
-                vid = vid.detach().cpu().numpy()
-                vid = (vid * 255).clip(0, 255).astype(np.uint8)
-                vid = rearrange(vid, "t h w c -> t c h w")
-                wandb.log({"video": wandb.Video(vid, fps=20, format='mp4')})
-                
-                # done logging video
-
-    
-                eval_data = next(expert_loader_eval)
-                data1 = eval_data['cam_zed_embd'].to(device)
-                data2 =  eval_data['cam_rs_embd'].to(device)
-
-                inputs1 = data1[:, :-1]
-                output1 = data1[:, 1:]
-
-                inputs2 = data2[:, :-1]
-                output2 = data2[:, 1:]
-
-                data_state = eval_data['state'].to(device)
-                states = data_state[:, :-1]
-                output_state = data_state[:, 1:]
-
-                data_acs = eval_data['action'].to(device)
-                data_acs = normalize_acs(data_acs, device)
-                acs = data_acs[:, :-1]
-                pred1, pred2, pred_state, _ = transition(inputs1, inputs2, states, acs)
-
-
-                pred_latent = torch.cat([pred1[:,[H-1]], pred2[:,[H-1]]], dim=0)
-                pred_ims, _ = decoder(pred_latent)
-                pred_im1, pred_im2 = torch.split(pred_ims, [inputs1.shape[0], inputs2.shape[0]], dim=0)
-                pred_im1 = pred_im1[0].permute(1,2,0).detach().cpu().numpy()
-                pred_im2 = pred_im2[0].permute(1,2,0).detach().cpu().numpy()
-                im1 = eval_data['agentview_image'][0, H].numpy()
-                im2 = eval_data['robot0_eye_in_hand_image'][0, H].numpy()
-                im1_loss = nn.MSELoss()(pred1, output1)
-                im2_loss = nn.MSELoss()(pred2, output2)
-                state_loss = nn.MSELoss()(pred_state, output_state)
-                loss = im1_loss + im2_loss + state_loss
+        # eval loop (using EMA model)
+        if (i) % args.eval_iter == 0:
+            eval_openloop(ema.shadow, decoder, expert_loader_imagine, info, args)
+            eval_loss, im1_loss, im2_loss, state_loss = eval_tf(ema.shadow, decoder, expert_loader_eval, info, args)
+            if eval_loss < best_eval:
+                best_eval = eval_loss
+                torch.save(ema.state_dict(), args.checkpoint_dir + 'best_testing.pth')
+            torch.save(transition.state_dict(), f'{args.checkpoint_dir}testing_iter{i}.pth')
+            torch.save(ema.state_dict(), f'{args.checkpoint_dir}testing_ema_iter{i}.pth')
+            torch.save({
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
+                'iter': i,
+                'best_eval': best_eval,
+            }, f'{args.checkpoint_dir}optim_iter{i}.pth')
             print()
-            print(f"\rIter {i}, Eval Loss: {loss.item():.4f}, front Loss: {im1_loss.item():.4f}, wrist Loss: {im2_loss.item():.4f}, state Loss: {state_loss.item():.4f}")
+            print(f"\rIter {i}, Eval Loss: {eval_loss.item():.4f}, front Loss: {im1_loss.item():.4f}, wrist Loss: {im2_loss.item():.4f}, state Loss: {state_loss.item():.4f}")
 
-            torch.save(transition.state_dict(), f'checkpoints/testing_iter{i}.pth')
-
-            if loss < best_eval:
-                best_eval = loss
-                torch.save(transition.state_dict(), 'checkpoints/best_testing.pth')
-            
-            transition.train()
-            wandb.log({'eval_loss': loss.item(), 'front_loss': im1_loss.item(), 'wrist_loss': im2_loss.item(), 'state_loss': state_loss.item(), 'pred_front': wandb.Image(pred_im1), 'pred_wrist': wandb.Image(pred_im2), 'front': wandb.Image(im1), 'wrist': wandb.Image(im2)})
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    main(args)
 
 
-    plt.legend()
-    plt.savefig('training curve.png')
+
