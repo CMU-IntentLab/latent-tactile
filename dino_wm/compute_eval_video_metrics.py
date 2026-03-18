@@ -54,7 +54,7 @@ except ImportError:
 
 # I3D-based FVD, Inception FID, batch LPIPS (SAILOR-FM style)
 try:
-    from dino_wm.metrics import (
+    from dino_wm.utils.metrics import (
         compute_fvd as compute_fvd_i3d,
         compute_fid as compute_fid_tensor,
         compute_lpips_batch,
@@ -67,7 +67,7 @@ try:
     HAS_FID_TENSOR = HAS_INCEPTION
 except ImportError:
     try:
-        from metrics import (
+        from utils.metrics import (
             compute_fvd as compute_fvd_i3d,
             compute_fid as compute_fid_tensor,
             compute_lpips_batch,
@@ -90,6 +90,18 @@ except ImportError:
 
 HAS_FVD = HAS_FVD_I3D or HAS_FVD_CD
 
+# Tactile/GelSight metrics (contact IoU, height map, gradient, optical flow)
+try:
+    from dino_wm.utils.tactile_metrics import compute_tactile_metrics, TACTILE_METRIC_NAMES
+    HAS_TACTILE_METRICS = True
+except ImportError:
+    try:
+        from utils.tactile_metrics import compute_tactile_metrics, TACTILE_METRIC_NAMES
+        HAS_TACTILE_METRICS = True
+    except ImportError:
+        HAS_TACTILE_METRICS = False
+        compute_tactile_metrics = None
+        TACTILE_METRIC_NAMES = []
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 METRIC_NAMES = ["mse", "mae", "psnr", "ssim", "lpips", "fid", "fvd"]
@@ -408,27 +420,39 @@ def compute_video_metrics(
     device: str = "cuda",
     fvd_ckpt_path: str | None = None,
     metric_max_frames: int | None = 64,
+    compute_tactile: bool = False,
+    tactile_only: bool = False,
+    contact_threshold: int = 30,
 ) -> dict[str, float]:
     """
     Compute all metrics for a single video (optimized with batching).
     metric_max_frames: subsample to this many frames for LPIPS/FID (faster).
+    compute_tactile: add GelSight metrics (contact IoU, height, gradient, flow).
+    tactile_only: compute only tactile metrics, skip standard metrics.
     """
+    if tactile_only:
+        all_names = TACTILE_METRIC_NAMES
+    else:
+        all_names = METRIC_NAMES + (TACTILE_METRIC_NAMES if compute_tactile else [])
     if not gt_frames or not pred_frames:
-        return {k: float("nan") for k in METRIC_NAMES}
+        return {k: float("nan") for k in all_names}
 
     n = min(len(gt_frames), len(pred_frames))
     gt_frames = gt_frames[:n]
     pred_frames = pred_frames[:n]
     dev = _get_device_for_metrics(device)
 
-    # Vectorized pixel metrics (fast)
-    gt_stack = np.stack(gt_frames, axis=0)
-    pred_stack = np.stack(pred_frames, axis=0)
-    pm = compute_pixel_metrics_batch(gt_stack, pred_stack)
-    ssim = compute_ssim_batch(gt_stack, pred_stack)
-    out = {**pm, "ssim": ssim}
+    if tactile_only:
+        out = {}
+    else:
+        # Vectorized pixel metrics (fast)
+        gt_stack = np.stack(gt_frames, axis=0)
+        pred_stack = np.stack(pred_frames, axis=0)
+        pm = compute_pixel_metrics_batch(gt_stack, pred_stack)
+        ssim = compute_ssim_batch(gt_stack, pred_stack)
+        out = {**pm, "ssim": ssim}
 
-    if compute_fid_lpips:
+    if not tactile_only and compute_fid_lpips:
         # Prefer tensor-based LPIPS/FID (no disk I/O, batched)
         if HAS_TORCH and HAS_LPIPS_METRICS and frames_to_image_tensor is not None and compute_lpips_batch is not None:
             n_frames = min(len(gt_frames), metric_max_frames) if metric_max_frames else len(gt_frames)
@@ -452,8 +476,16 @@ def compute_video_metrics(
         else:
             out["fid"] = compute_fid_metric(gt_frames, pred_frames)
         out["fvd"] = compute_fvd_metric(gt_frames, pred_frames, device=dev, fvd_ckpt_path=fvd_ckpt_path)
-    else:
+    elif not tactile_only:
         out["lpips"] = out["fid"] = out["fvd"] = float("nan")
+
+    if (tactile_only or compute_tactile) and HAS_TACTILE_METRICS and compute_tactile_metrics is not None:
+        try:
+            tactile = compute_tactile_metrics(gt_frames, pred_frames, contact_threshold=contact_threshold)
+            out.update(tactile)
+        except Exception:
+            for k in TACTILE_METRIC_NAMES:
+                out[k] = float("nan")
 
     return out
 
@@ -464,6 +496,9 @@ def compute_all_metrics(
     device: str = "cuda",
     fvd_ckpt_path: str | None = None,
     metric_max_frames: int | None = 64,
+    compute_tactile: bool = False,
+    tactile_only: bool = False,
+    contact_threshold: int = 30,
 ) -> dict:
     """
     Compute metrics for all videos in all _eval folders.
@@ -473,6 +508,7 @@ def compute_all_metrics(
     }
     FVD is computed per-folder (requires multiple videos); per-video FVD is nan.
     """
+    all_metric_names = TACTILE_METRIC_NAMES if tactile_only else (METRIC_NAMES + (TACTILE_METRIC_NAMES if compute_tactile else []))
     per_video = {}
     folder_gt_pred_pairs = {}
     for folder in eval_folders:
@@ -489,7 +525,7 @@ def compute_all_metrics(
                 frames = get_video_frames(path)
                 gt_frames, pred_frames = extract_gt_pred_from_frames(frames)
                 if not gt_frames or not pred_frames:
-                    per_video[folder_name][fname] = {k: float("nan") for k in METRIC_NAMES}
+                    per_video[folder_name][fname] = {k: float("nan") for k in all_metric_names}
                 else:
                     m = compute_video_metrics(
                         gt_frames, pred_frames,
@@ -497,11 +533,14 @@ def compute_all_metrics(
                         device=device,
                         fvd_ckpt_path=fvd_ckpt_path,
                         metric_max_frames=metric_max_frames,
+                        compute_tactile=compute_tactile or tactile_only,
+                        tactile_only=tactile_only,
+                        contact_threshold=contact_threshold,
                     )
                     per_video[folder_name][fname] = m
                     folder_gt_pred_pairs[folder_name].append((gt_frames, pred_frames))
             except Exception as e:
-                per_video[folder_name][fname] = {k: float("nan") for k in METRIC_NAMES}
+                per_video[folder_name][fname] = {k: float("nan") for k in all_metric_names}
                 print(f"\n    Warning: failed {fname}: {e}")
         print(f"{len(per_video[folder_name])} videos")
 
@@ -509,10 +548,10 @@ def compute_all_metrics(
     per_folder_mean = {}
     for folder_name, videos in per_video.items():
         if not videos:
-            per_folder_mean[folder_name] = {k: float("nan") for k in METRIC_NAMES}
+            per_folder_mean[folder_name] = {k: float("nan") for k in all_metric_names}
             continue
         means = {}
-        for k in METRIC_NAMES:
+        for k in all_metric_names:
             if k == "fvd":
                 continue
             vals = [
@@ -521,7 +560,7 @@ def compute_all_metrics(
             ]
             means[k] = float(np.mean(vals)) if vals else float("nan")
         # FVD: compute per-folder (I3D or cd-fvd; requires 2+ videos)
-        if compute_fid_lpips and HAS_FVD:
+        if not tactile_only and compute_fid_lpips and HAS_FVD:
             pairs = folder_gt_pred_pairs.get(folder_name, [])
             if len(pairs) >= 2:
                 print(f"    Computing FVD for {folder_name} ({len(pairs)} videos)...", end=" ", flush=True)
@@ -547,7 +586,7 @@ def print_metrics_summary(metrics_data: dict) -> None:
     for folder_name in sorted(per_folder.keys()):
         m = per_folder[folder_name]
         print(f"\n{folder_name}:")
-        for k in METRIC_NAMES:
+        for k in sorted(m.keys()):
             v = m.get(k, float("nan"))
             if isinstance(v, float) and np.isnan(v):
                 print(f"  {k}: N/A")
@@ -794,6 +833,22 @@ def main():
         default=64,
         help="Max frames for LPIPS/FID (subsample for speed). 0 = use all. Default 64.",
     )
+    p.add_argument(
+        "--tactile_metrics",
+        action="store_true",
+        help="Add GelSight/tactile metrics: contact IoU, height MAE/RMSE, gradient similarity, optical flow.",
+    )
+    p.add_argument(
+        "--tactile_only",
+        action="store_true",
+        help="Compute only tactile metrics (skip MSE, MAE, PSNR, SSIM, LPIPS, FID, FVD). Implies --tactile_metrics.",
+    )
+    p.add_argument(
+        "--contact_threshold",
+        type=int,
+        default=30,
+        help="Pixel intensity threshold for contact mask (default 30). Used with --tactile_metrics.",
+    )
     args = p.parse_args()
 
     root = os.path.abspath(args.root_dir)
@@ -837,26 +892,39 @@ def main():
         )
 
     # Metrics computation
-    if args.metrics:
-        missing = []
-        if not HAS_SSIM:
-            missing.append("scikit-image")
-        if not HAS_LPIPS:
-            missing.append("lpips")
-        if not HAS_FID:
-            missing.append("clean-fid")
-        if not HAS_FVD:
-            missing.append("cd-fvd")
-        if missing:
-            print(f"\nNote: For full metrics: pip install {' '.join(missing)}")
-        if not HAS_FVD:
+    if args.metrics or args.tactile_only:
+        if args.tactile_only and not HAS_TACTILE_METRICS:
+            raise SystemExit("--tactile_only requires tactile_metrics (dino_wm.tactile_metrics)")
+        if not args.tactile_only:
+            missing = []
+            if not HAS_SSIM:
+                missing.append("scikit-image")
+            if not HAS_LPIPS:
+                missing.append("lpips")
+            if not HAS_FID:
+                missing.append("clean-fid")
+            if not HAS_FVD:
+                missing.append("cd-fvd")
+            if missing:
+                print(f"\nNote: For full metrics: pip install {' '.join(missing)}")
+        if not args.tactile_only and not HAS_FVD:
             print("Note: FVD requires torch (I3D) or cdfvd+--fvd_ckpt_path (VideoMAE)")
-        print("Computing metrics (MSE, MAE, PSNR, SSIM, LPIPS, FID, FVD)...")
+        if args.tactile_only:
+            msg = "Computing tactile metrics only (contact IoU, height, gradient, flow)..."
+        else:
+            msg = "Computing metrics (MSE, MAE, PSNR, SSIM, LPIPS, FID, FVD"
+            if args.tactile_metrics:
+                msg += ", contact IoU, height, gradient, flow"
+            msg += ")..."
+        print(msg)
         metrics_data = compute_all_metrics(
             eval_folders,
-            compute_fid_lpips=not args.no_fid_lpips,
+            compute_fid_lpips=not args.no_fid_lpips and not args.tactile_only,
             fvd_ckpt_path=args.fvd_ckpt_path,
             metric_max_frames=args.metric_max_frames or None,
+            compute_tactile=args.tactile_metrics or args.tactile_only,
+            tactile_only=args.tactile_only,
+            contact_threshold=args.contact_threshold,
         )
         metrics_path = args.metrics_output or os.path.join(out_dir, "metrics.json")
 

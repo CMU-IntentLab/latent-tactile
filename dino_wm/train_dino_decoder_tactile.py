@@ -18,6 +18,8 @@ RAE loss (--loss rae): L1 + LPIPS + adversarial, following
 
 import argparse
 import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -81,159 +83,46 @@ def ensure_patch_grid(embd: torch.Tensor, target_side: int) -> torch.Tensor:
 
 
 def parse_args():
+    import sys
+    from config import load_config
+
+    config_path = str(Path(__file__).parent / "configs" / "default.yaml")
+    if "--config" in sys.argv:
+        idx = sys.argv.index("--config")
+        if idx + 1 < len(sys.argv):
+            config_path = sys.argv[idx + 1]
+    cfg = load_config("train_decoder", config_path)
+
     p = argparse.ArgumentParser(
-        description="Train DINO decoder on tactile dataset (camera_0, camera_1, camera_2)"
+        description="Train DINO decoder on tactile dataset (see configs/default.yaml)"
     )
-    p.add_argument(
-        "--hdf5_path",
-        type=str,
-        required=True,
-        help="Path to consolidated HDF5 or directory with .hdf5 files",
-    )
-    p.add_argument(
-        "--mode",
-        type=str,
-        choices=["tactile", "per_camera", "all", "custom"],
-        default="tactile",
-        help="tactile: vision (cam0+1) share decoder 384, tactile has own decoder; per_camera/all/custom",
-    )
-    p.add_argument(
-        "--cameras",
-        type=str,
-        default=None,
-        help="For custom mode: comma-separated list, e.g. 'camera_0,camera_1' or 'camera_0,camera_2'",
-    )
-    p.add_argument(
-        "--output_dir",
-        type=str,
-        default="checkpoints",
-        help="Directory to save checkpoints",
-    )
-    p.add_argument(
-        "--batch_size",
-        type=int,
-        default=64,
-    )
-    p.add_argument(
-        "--segment_length",
-        type=int,
-        default=1,
-        help="Timesteps per segment (1 = single frame)",
-    )
-    p.add_argument(
-        "--num_test",
-        type=int,
-        default=20,
-        help="Number of trajectories for validation split",
-    )
-    p.add_argument(
-        "--iters",
-        type=int,
-        default=5000,
-    )
-    p.add_argument(
-        "--lr",
-        type=float,
-        default=3e-4,
-    )
-    p.add_argument(
-        "--patch_side",
-        type=int,
-        default=14,
-        help="Expected patch grid side (14 for DINO 14x14)",
-    )
-    p.add_argument(
-        "--device",
-        type=str,
-        default="cuda:0",
-    )
-    p.add_argument(
-        "--wandb",
-        action="store_true",
-        help="Log to Weights & Biases",
-    )
-    p.add_argument(
-        "--no_consolidated",
-        action="store_true",
-        help="hdf5_path is a directory of individual .hdf5 files",
-    )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for train/test split",
-    )
-    p.add_argument(
-        "--loss",
-        type=str,
-        choices=["mse", "l1", "l1_edge", "perceptual", "l1_perceptual", "rae"],
-        default="mse",
-        help="Loss: mse, l1, l1_edge, perceptual, l1_perceptual, or rae (L1+LPIPS+GAN per paper)",
-    )
-    p.add_argument(
-        "--l1_weight",
-        type=float,
-        default=1.0,
-        help="Weight for L1 term when using l1_edge or l1_perceptual loss",
-    )
-    p.add_argument(
-        "--edge_weight",
-        type=float,
-        default=0.5,
-        help="Weight for edge/gradient term when using l1_edge loss",
-    )
-    p.add_argument(
-        "--perceptual_weight",
-        type=float,
-        default=0.1,
-        help="Weight for perceptual term when using l1_perceptual loss",
-    )
-    p.add_argument(
-        "--resize_to_224",
-        action="store_true",
-        help="Resize images to 224x224 (default: keep original size)",
-    )
-    # RAE loss args (from https://arxiv.org/abs/2510.11690)
-    p.add_argument(
-        "--lpips_weight",
-        type=float,
-        default=1.0,
-        help="Weight for LPIPS in RAE loss (paper: 1.0)",
-    )
-    p.add_argument(
-        "--gan_weight",
-        type=float,
-        default=0.75,
-        help="Base weight for GAN in RAE loss before adaptive lambda (paper: 0.75)",
-    )
-    p.add_argument(
-        "--disc_start_iter",
-        type=int,
-        default=600,
-        help="Start training discriminator at this iter (paper: epoch 6)",
-    )
-    p.add_argument(
-        "--adv_start_iter",
-        type=int,
-        default=800,
-        help="Start adding adversarial loss to decoder at this iter (paper: epoch 8)",
-    )
-    p.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="DataLoader workers for parallel data loading (0 = main thread only)",
-    )
-    p.add_argument(
-        "--amp",
-        action="store_true",
-        help="Use automatic mixed precision for faster training",
-    )
-    p.add_argument(
-        "--compile",
-        action="store_true",
-        help="Use torch.compile for faster training (PyTorch 2.0+)",
-    )
+    p.add_argument("--config", type=str, default=config_path)
+    p.add_argument("--hdf5_path", type=str, required=True)
+    p.add_argument("--mode", type=str, choices=["tactile", "per_camera", "all", "custom"], default=cfg.get("mode", "tactile"))
+    p.add_argument("--cameras", type=str, default=cfg.get("cameras"))
+    p.add_argument("--output_dir", type=str, default=cfg.get("output_dir", "checkpoints"))
+    p.add_argument("--batch_size", type=int, default=cfg.get("batch_size", 64))
+    p.add_argument("--segment_length", type=int, default=cfg.get("segment_length", 1))
+    p.add_argument("--num_test", type=int, default=cfg.get("num_test", 20))
+    p.add_argument("--iters", type=int, default=cfg.get("iters", 5000))
+    p.add_argument("--lr", type=float, default=cfg.get("lr", 3e-4))
+    p.add_argument("--patch_side", type=int, default=cfg.get("patch_side", 14))
+    p.add_argument("--device", type=str, default=cfg.get("device", "cuda:0"))
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--no_consolidated", action="store_true")
+    p.add_argument("--seed", type=int, default=cfg.get("seed", 42))
+    p.add_argument("--loss", type=str, choices=["mse", "l1", "l1_edge", "perceptual", "l1_perceptual", "rae"], default=cfg.get("loss", "mse"))
+    p.add_argument("--l1_weight", type=float, default=cfg.get("l1_weight", 1.0))
+    p.add_argument("--edge_weight", type=float, default=cfg.get("edge_weight", 0.5))
+    p.add_argument("--perceptual_weight", type=float, default=cfg.get("perceptual_weight", 0.1))
+    p.add_argument("--resize_to_224", action="store_true")
+    p.add_argument("--lpips_weight", type=float, default=cfg.get("lpips_weight", 1.0))
+    p.add_argument("--gan_weight", type=float, default=cfg.get("gan_weight", 0.75))
+    p.add_argument("--disc_start_iter", type=int, default=cfg.get("disc_start_iter", 600))
+    p.add_argument("--adv_start_iter", type=int, default=cfg.get("adv_start_iter", 800))
+    p.add_argument("--num_workers", type=int, default=cfg.get("num_workers", 4))
+    p.add_argument("--amp", action="store_true")
+    p.add_argument("--compile", action="store_true")
     return p.parse_args()
 
 
@@ -520,7 +409,8 @@ def train_one_decoder(
 
     group_name = "+".join(camera_group)
     if args.wandb and HAS_WANDB:
-        wandb.init(project="dino-decoder-tactile", name=f"decoder_{group_name}")
+        from config import get_wandb_config
+        wandb.init(project="dino-decoder-tactile", name=f"decoder_{group_name}", config=get_wandb_config("train_decoder", args))
 
     use_amp = args.amp and torch.cuda.is_available()
     scaler = torch.amp.GradScaler("cuda") if use_amp else None

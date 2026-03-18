@@ -7,6 +7,7 @@ and optionally saving decoded image samples.
 
 import argparse
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -124,116 +125,39 @@ def infer_emb_dim_from_checkpoint(checkpoint_path: str) -> int:
 
 
 def parse_args():
+    import sys
+    from config import load_config
+
+    config_path = str(Path(__file__).parent / "configs" / "default.yaml")
+    if "--config" in sys.argv:
+        idx = sys.argv.index("--config")
+        if idx + 1 < len(sys.argv):
+            config_path = sys.argv[idx + 1]
+    cfg = load_config("eval_decoder", config_path)
+
     p = argparse.ArgumentParser(
-        description="Evaluate trained DINO decoder on tactile dataset"
+        description="Evaluate DINO decoder (see configs/default.yaml)"
     )
-    p.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to decoder checkpoint (.pth)",
-    )
-    p.add_argument(
-        "--hdf5_path",
-        type=str,
-        required=True,
-        help="Path to consolidated HDF5 or directory with .hdf5 files",
-    )
-    p.add_argument(
-        "--cameras",
-        type=str,
-        required=True,
-        help="Comma-separated cameras this decoder was trained on, e.g. 'camera_0,camera_1' or 'camera_2'",
-    )
-    p.add_argument(
-        "--emb_dim",
-        type=int,
-        default=None,
-        help="Decoder emb_dim (inferred from checkpoint if not set)",
-    )
-    p.add_argument(
-        "--batch_size",
-        type=int,
-        default=64,
-    )
-    p.add_argument(
-        "--segment_length",
-        type=int,
-        default=1,
-    )
-    p.add_argument(
-        "--num_test",
-        type=int,
-        default=100,
-        help="Number of trajectories for test split",
-    )
-    p.add_argument(
-        "--patch_side",
-        type=int,
-        default=14,
-    )
-    p.add_argument(
-        "--device",
-        type=str,
-        default="cuda:0",
-    )
-    p.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="If set, save sample gt/pred image pairs to this directory",
-    )
-    p.add_argument(
-        "--num_samples",
-        type=int,
-        default=8,
-        help="Number of sample images to save when --output_dir is set",
-    )
-    p.add_argument(
-        "--no_consolidated",
-        action="store_true",
-        help="hdf5_path is a directory of individual .hdf5 files",
-    )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-    p.add_argument(
-        "--wandb",
-        action="store_true",
-        help="Log results and sample images to Weights & Biases",
-    )
-    p.add_argument(
-        "--wandb_project",
-        type=str,
-        default="dino-decoder-tactile",
-        help="W&B project name",
-    )
-    p.add_argument(
-        "--wandb_run_name",
-        type=str,
-        default=None,
-        help="W&B run name (default: eval_{cameras})",
-    )
-    p.add_argument(
-        "--num_episode_videos",
-        type=int,
-        default=3,
-        help="Number of full episodes to log as gt/pred/diff videos to wandb",
-    )
-    p.add_argument(
-        "--max_episode_len",
-        type=int,
-        default=100,
-        help="Max timesteps per episode video (truncate if longer)",
-    )
-    p.add_argument(
-        "--video_fps",
-        type=int,
-        default=10,
-        help="FPS for wandb video",
-    )
+    p.add_argument("--config", type=str, default=config_path)
+    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--hdf5_path", type=str, required=True)
+    p.add_argument("--cameras", type=str, required=True, help="Cameras this decoder was trained on, e.g. 'camera_0,camera_1' or 'camera_2'")
+    p.add_argument("--emb_dim", type=int, default=None)
+    p.add_argument("--batch_size", type=int, default=cfg.get("batch_size", 64))
+    p.add_argument("--segment_length", type=int, default=cfg.get("segment_length", 1))
+    p.add_argument("--num_test", type=int, default=cfg.get("num_test", 100))
+    p.add_argument("--patch_side", type=int, default=cfg.get("patch_side", 14))
+    p.add_argument("--device", type=str, default=cfg.get("device", "cuda:0"))
+    p.add_argument("--output_dir", type=str, default=None)
+    p.add_argument("--num_samples", type=int, default=cfg.get("num_samples", 8))
+    p.add_argument("--no_consolidated", action="store_true")
+    p.add_argument("--seed", type=int, default=cfg.get("seed", 42))
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default=cfg.get("wandb_project", "dino-decoder-tactile"))
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--num_episode_videos", type=int, default=cfg.get("num_episode_videos", 3))
+    p.add_argument("--max_episode_len", type=int, default=cfg.get("max_episode_len", 100))
+    p.add_argument("--video_fps", type=int, default=cfg.get("video_fps", 10))
     return p.parse_args()
 
 
@@ -281,8 +205,9 @@ def main():
     wandb_images = {} if (args.wandb and HAS_WANDB) else None
 
     if args.wandb and HAS_WANDB:
+        from config import get_wandb_config
         run_name = args.wandb_run_name or f"eval_{'+'.join(cameras)}"
-        wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
+        wandb.init(project=args.wandb_project, name=run_name, config=get_wandb_config("eval_decoder", args))
 
     with torch.no_grad():
         for data in tqdm(eval_loader, desc="Evaluating"):

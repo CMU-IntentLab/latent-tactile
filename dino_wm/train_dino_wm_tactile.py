@@ -11,6 +11,8 @@ and supports AnyTouch (512-dim) for tactile. Similar to train_dino_wm.py but wit
 
 import argparse
 import os
+from pathlib import Path
+
 import numpy as np
 import torch
 import random
@@ -27,7 +29,7 @@ except ImportError:
     HAS_WANDB = False
 
 from tactile_dataset import TactileTrajectoryDataset, CAMERA_CONFIG, load_full_episode
-from dino_models import TactileVideoTransformer, normalize_acs
+from dino_models import TactileVideoTransformer, normalize_acs, normalize_states
 
 # VQVAE Quantize needs dist_fn for training; we use a no-op for eval
 import dino_decoder as _dino_dec_mod
@@ -64,99 +66,55 @@ def ensure_patch_grid(embd: torch.Tensor, target_side: int) -> torch.Tensor:
 
 
 def parse_args():
+    import sys
+    from config import load_config
+
+    config_path = str(Path(__file__).parent / "configs" / "default.yaml")
+    if "--config" in sys.argv:
+        idx = sys.argv.index("--config")
+        if idx + 1 < len(sys.argv):
+            config_path = sys.argv[idx + 1]
+    cfg = load_config("train_wm", config_path)
+
     p = argparse.ArgumentParser(
-        description="Train DINO world model on tactile dataset with configurable cameras"
+        description="Train DINO world model on tactile dataset (see configs/default.yaml)"
     )
+    p.add_argument("--config", type=str, default=config_path, help="Path to config YAML")
     p.add_argument("--hdf5_path", type=str, required=True, help="Path to consolidated HDF5")
-    p.add_argument(
-        "--cameras",
-        type=str,
-        default="camera_0,camera_1,camera_2",
-        help="Comma-separated cameras to use (default: all three)",
-    )
-    p.add_argument(
-        "--condition_cameras",
-        type=str,
-        default=None,
-        help="Cameras to condition on (default: same as --cameras)",
-    )
-    p.add_argument(
-        "--predict_cameras",
-        type=str,
-        default=None,
-        help="Cameras to predict (default: same as --cameras)",
-    )
-    p.add_argument("--output_dir", type=str, default="checkpoints")
-    p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--segment_length", type=int, default=4, help="Timesteps per segment (BL)")
-    p.add_argument("--num_test", type=int, default=50)
-    p.add_argument("--iters", type=int, default=100000)
-    p.add_argument("--eval_every", type=int, default=1000)
-    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--norm_stats_json", type=str, default=None)
+    p.add_argument("--cameras", type=str, default=cfg.get("cameras", "camera_0,camera_1,camera_2"))
+    p.add_argument("--condition_cameras", type=str, default=None)
+    p.add_argument("--predict_cameras", type=str, default=None)
+    p.add_argument("--output_dir", type=str, default=cfg.get("output_dir", "checkpoints"))
+    p.add_argument("--batch_size", type=int, default=cfg.get("batch_size", 16))
+    p.add_argument("--segment_length", type=int, default=cfg.get("segment_length", 4))
+    p.add_argument("--num_test", type=int, default=cfg.get("num_test", 50))
+    p.add_argument("--iters", type=int, default=cfg.get("iters", 100000))
+    p.add_argument("--eval_every", type=int, default=cfg.get("eval_every", 1000))
+    p.add_argument("--device", type=str, default=cfg.get("device", "cuda:0"))
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--no_consolidated", action="store_true")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--ar_loss_weight", type=float, default=0.5)
-    p.add_argument(
-        "--ar_loss_mode",
-        type=str,
-        choices=["single", "multi_step"],
-        default="single",
-        help="AR loss mode: 'single' = 1 step ahead (default); 'multi_step' = sample k from 3-5, sum loss over steps 1..k (use --segment_length 6+ for k>2)",
+    p.add_argument("--seed", type=int, default=cfg.get("seed", 42))
+    p.add_argument("--ar_loss_weight", type=float, default=cfg.get("ar_loss_weight", 0.5))
+    p.add_argument("--ar_loss_mode", type=str, choices=["single", "multi_step"], default=cfg.get("ar_loss_mode", "single"))
+    p.add_argument("--decoder_dir", type=str, default=cfg.get("decoder_dir"))
+    p.add_argument("--eval_rollout_horizon", type=int, default=cfg.get("eval_rollout_horizon", 16))
+    p.add_argument("--num_eval_videos", type=int, default=cfg.get("num_eval_videos", 1))
+    p.add_argument("--video_fps", type=int, default=cfg.get("video_fps", 10))
+    p.add_argument("--video_every_eval", type=int, default=cfg.get("video_every_eval", 3))
+    p.add_argument("--num_workers", type=int, default=cfg.get("num_workers", 4))
+    p.add_argument("--no_compile", action="store_true")
+    p.add_argument("--segment_sampling", type=str, choices=["uniform", "weighted"], default=cfg.get("segment_sampling", "uniform"))
+    p.add_argument("--gripper_change_weight", type=float, default=cfg.get("gripper_change_weight", 5.0))
+    p.add_argument("--weight_source", type=str, choices=["gripper_state", "gripper_change_json"], default=cfg.get("weight_source", "gripper_state"))
+    p.add_argument("--gripper_change_json_path", type=str, default=None)
+    p.add_argument("--normalize_states", action="store_true", help="Normalize states using norm_stats.json (min-max to [0,1])")
+    p.set_defaults(normalize_states=cfg.get("normalize_states", False))
+    args = p.parse_args()
+    args.norm_stats_path = args.norm_stats_json or os.path.join(
+        os.path.dirname(os.path.abspath(args.hdf5_path)), "norm_stats.json"
     )
-    p.add_argument(
-        "--decoder_dir",
-        type=str,
-        default=None,
-        help="Directory with decoder checkpoints for video logging (decoder_camera_0_camera_1.pth, decoder_camera_2.pth)",
-    )
-    p.add_argument("--eval_rollout_horizon", type=int, default=16)
-    p.add_argument("--num_eval_videos", type=int, default=1)
-    p.add_argument("--video_fps", type=int, default=10)
-    p.add_argument(
-        "--video_every_eval",
-        type=int,
-        default=3,
-        help="Log eval video every N evals (default: 3, i.e. every 3rd eval)",
-    )
-    p.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="DataLoader num_workers for parallel loading (0 to disable)",
-    )
-    p.add_argument(
-        "--no_compile",
-        action="store_true",
-        help="Disable torch.compile (use if compilation causes issues)",
-    )
-    p.add_argument(
-        "--segment_sampling",
-        type=str,
-        choices=["uniform", "weighted"],
-        default="uniform",
-        help="Segment sampling: 'uniform' (default) or 'weighted' (favor segments with gripper change)",
-    )
-    p.add_argument(
-        "--gripper_change_weight",
-        type=float,
-        default=5.0,
-        help="When segment_sampling=weighted, segments with gripper change get this weight vs 1.0 (default 5)",
-    )
-    p.add_argument(
-        "--weight_source",
-        type=str,
-        choices=["gripper_state", "gripper_change_json"],
-        default="gripper_state",
-        help="When weighted: 'gripper_state' (max-min>0.01) or 'gripper_change_json' (overlap index_0/1±2)",
-    )
-    p.add_argument(
-        "--gripper_change_json_path",
-        type=str,
-        default=None,
-        help="Path to gripper_change.json (required when weight_source=gripper_change_json)",
-    )
-    return p.parse_args()
+    return args
 
 
 def load_decoders(decoder_dir: str, predict_cameras: list, device: str) -> dict:
@@ -228,10 +186,12 @@ def create_eval_video(
 
     # Build initial inputs from episode
     states = torch.tensor(ep_data["states"][:T], dtype=torch.float32, device=device).unsqueeze(0)
+    if args.normalize_states:
+        states = normalize_states(states, device, args.norm_stats_path)
     actions = torch.tensor(ep_data["actions"][:T], dtype=torch.float32, device=device).unsqueeze(0)
     if actions.shape[-1] > 7:
         actions = actions[..., :7]
-    actions = normalize_acs(actions, device)
+    actions = normalize_acs(actions, device, norm_stats_path=args.norm_stats_path)
 
     inputs = {}
     for c in condition_cameras:
@@ -299,9 +259,10 @@ def main():
             raise SystemExit(f"Unknown camera: {c}. Choose from {list(CAMERA_CONFIG.keys())}")
 
     if args.wandb and HAS_WANDB:
-        wandb.init(project="dino-wm-tactile", name=f"wm_{'+'.join(cameras)}")
-        config = {**vars(args), "cameras": cameras, "condition_cameras": condition_cameras, "predict_cameras": predict_cameras}
-        wandb.config.update(config, allow_val_change=True)
+        from config import get_wandb_config
+        wandb_cfg = get_wandb_config("train_wm", args)
+        wandb_cfg.update(cameras=cameras, condition_cameras=condition_cameras, predict_cameras=predict_cameras)
+        wandb.init(project="dino-wm-tactile", name=f"wm_{'+'.join(cameras)}", config=wandb_cfg)
 
     use_amp = True
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -316,6 +277,7 @@ def main():
     np.random.seed(args.seed)
 
     BL = args.segment_length
+    print('segment length: ', BL)
     H = BL - 1
     EVAL_H = 16
     device = args.device
@@ -443,13 +405,15 @@ def main():
         cond_inputs = {c: camera_inputs[c] for c in condition_cameras}
 
         data_state = data["state"].to(device, non_blocking=non_blocking)
+        if args.normalize_states:
+            data_state = normalize_states(data_state, device, args.norm_stats_path)
         inputs_states = data_state[:, :-1]
         output_state = data_state[:, 1:]
 
         data_acs = data["action"].to(device, non_blocking=non_blocking)
         if data_acs.shape[-1] > 7:
             data_acs = data_acs[..., :7]
-        norm_acs = normalize_acs(data_acs, device)
+        norm_acs = normalize_acs(data_acs, device, norm_stats_path=args.norm_stats_path)
         acs = norm_acs[:, :-1]
 
         optimizer.zero_grad()
@@ -560,10 +524,13 @@ def main():
                 cond_inputs = {c: eval_inputs[c] for c in condition_cameras}
                 eval_states = eval_data["state"].to(device, non_blocking=non_blocking)[:, :-1]
                 eval_output_state = eval_data["state"].to(device, non_blocking=non_blocking)[:, 1:]
+                if args.normalize_states:
+                    eval_states = normalize_states(eval_states, device, args.norm_stats_path)
+                    eval_output_state = normalize_states(eval_output_state, device, args.norm_stats_path)
                 eval_acs_raw = eval_data["action"].to(device, non_blocking=non_blocking)
                 if eval_acs_raw.shape[-1] > 7:
                     eval_acs_raw = eval_acs_raw[..., :7]
-                eval_acs = normalize_acs(eval_acs_raw, device)[:, :-1]
+                eval_acs = normalize_acs(eval_acs_raw, device, norm_stats_path=args.norm_stats_path)[:, :-1]
 
                 preds_eval, pred_state_eval = transition(cond_inputs, eval_states, eval_acs)
                 eval_loss = nn.MSELoss()(pred_state_eval, eval_output_state)

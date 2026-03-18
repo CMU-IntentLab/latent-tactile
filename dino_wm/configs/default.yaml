@@ -1,0 +1,88 @@
+# Default config for dino_wm tactile pipeline.
+# Override with --config path/to/custom.yaml or individual CLI args.
+
+# Shared dataset settings
+dataset:
+  cameras: "camera_0,camera_1,camera_2"
+  segment_length: 4
+  num_test: 50
+  seed: 42
+  no_consolidated: false
+
+# train_dino_wm_tactile
+train_wm:
+  norm_stats_path: /data/yilin/tactile_wipe_wm_info.json  # Path to norm_stats.json (min-max to [0,1])
+  hdf5_path: /data/yilin/tactile_wipe_wm_vits16.hdf5
+  normalize_states: false  # Normalize states using norm_stats.json (min-max to [0,1])
+  output_dir: checkpoints
+  batch_size: 16
+  iters: 100000
+  eval_every: 1000
+  device: cuda:0
+  ar_loss_weight: 0.5
+  ar_loss_mode: single  # single | multi_step
+  segment_sampling: uniform  # uniform | weighted
+  gripper_change_weight: 5.0
+  weight_source: gripper_change_json  # gripper_state | gripper_change_json
+  num_workers: 4
+  no_compile: false
+  # Decoder for video logging
+  decoder_dir: null
+  eval_rollout_horizon: 16
+  num_eval_videos: 1
+  video_fps: 10
+  video_every_eval: 3
+
+# eval_dino_wm_tactile
+eval_wm:
+  normalize_states: false  # Must match training; set true when model was trained with normalize_states
+  batch_size: 16
+  num_test: 100
+  device: cuda:0
+  num_samples: 8
+  num_episode_videos: 20
+  max_episode_len: 300
+  video_fps: 10
+  chunk_size: 8
+  start_after_gripper_close: false
+  gripper_idx: 6
+  gripper_closed_threshold: -0.5
+  wandb_project: dino-wm-tactile
+
+# train_dino_decoder_tactile
+train_decoder:
+  mode: tactile  # tactile | per_camera | all | custom
+  output_dir: checkpoints
+  batch_size: 64
+  segment_length: 1
+  num_test: 20
+  iters: 5000
+  lr: 0.0003
+  patch_side: 14
+  device: cuda:0
+  loss: rae  # mse | l1 | l1_edge | perceptual | l1_perceptual | rae
+  l1_weight: 1.0
+  edge_weight: 0.5
+  perceptual_weight: 0.1
+  resize_to_224: false
+  # RAE loss
+  lpips_weight: 1.0
+  gan_weight: 0.75
+  disc_start_iter: 600
+  adv_start_iter: 800
+  num_workers: 4
+  amp: false
+  compile: true
+
+# eval_dino_decoder_tactile
+eval_decoder:
+  batch_size: 64
+  segment_length: 1
+  num_test: 100
+  patch_side: 14
+  device: cuda:0
+  num_samples: 8
+  num_episode_videos: 3
+  max_episode_len: 100
+  video_fps: 10
+  wandb_project: dino-decoder-tactile

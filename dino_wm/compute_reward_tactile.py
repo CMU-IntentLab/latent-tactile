@@ -10,9 +10,13 @@ Two modes:
 Based on AnyTouch2/scripts/infer_touch_text_similarity.py.
 
 Usage:
-  # From tactile videos (encode with AnyTouch)
+  # From tactile video(s) (encode with AnyTouch)
   python compute_reward_tactile.py --mode video --video_path path/to/video.mp4 \\
     --text "wiping the board" --text "no contact" --checkpoint /path/to/AnyTouch2/checkpoints/checkpoint-4frames.pth
+
+  # From directory of videos (runs for every video in the dir)
+  python compute_reward_tactile.py --mode video --video_path path/to/video_dir \\
+    --text "wiping the board" --checkpoint /path/to/AnyTouch2/checkpoints/checkpoint-4frames.pth
 
   # From saved embeddings (mean over patches, no encoder)
   python compute_reward_tactile.py --mode embeddings --embeddings_path eval_embeds/*_pred_embeds.npz \\
@@ -78,13 +82,25 @@ def load_frames_from_directory(dir_path: str) -> list[np.ndarray]:
     return [np.array(Image.open(p).convert("RGB")) for p in paths]
 
 
+VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v")
+
+
 def resolve_video_sources(path: str):
-    """Resolve to list of (path, name) for videos or frame dirs."""
+    """Resolve to list of (path, name) for videos or frame dirs.
+    When path is a directory: first looks for video files (.mp4, .avi, etc.) - runs one per video.
+    If no video files, falls back to directory of frames or subdirs."""
     if os.path.isdir(path):
-        # Directory: could be frames of one sequence, or subdirs with videos
+        # Directory of videos: list video files directly in that dir
+        video_files = []
+        for f in sorted(os.listdir(path)):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in VIDEO_EXTENSIONS:
+                video_files.append((os.path.join(path, f), os.path.splitext(f)[0]))
+        if video_files:
+            return video_files
+        # No videos: directory of frames or subdirs
         subdirs = [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
         if subdirs:
-            # Assume subdirs are frame dirs or contain videos
             return [(os.path.join(path, d), d) for d in sorted(subdirs)]
         # Single dir of frames
         return [(path, os.path.basename(path.rstrip("/")))]
@@ -312,6 +328,23 @@ def parse_trajectory_id_from_filename(npz_path: str) -> str | None:
     """
     base = os.path.basename(npz_path)
     m = re.match(r"episode_\d+_traj_(.+?)_(?:pred|gt)_embeds\.npz", base)
+    if m:
+        return m.group(1)
+    return None
+
+
+def parse_trajectory_id_from_video_path(video_path: str) -> str | None:
+    """
+    Extract trajectory_id from video filename or directory name (for HDF5 RGB lookup).
+    e.g. episode_0_traj_trajectory_0_result.mp4 -> trajectory_0
+         episode_0_traj_123.mp4 -> 123
+         episode_0_traj_123/ (dir) -> 123
+    """
+    base = os.path.basename(video_path.rstrip("/"))
+    m = re.match(r"episode_\d+_traj_(.+?)(?:_result)?\.(?:mp4|avi|mov|mkv|webm|m4v)$", base, re.I)
+    if m:
+        return m.group(1)
+    m = re.match(r"episode_\d+_traj_(.+)$", base)
     if m:
         return m.group(1)
     return None
@@ -611,6 +644,27 @@ def extract_tactile_from_horizontal_frames(
     return result
 
 
+def build_three_panel_row_frames(
+    tactile_frames: list[np.ndarray],
+    panel_size: tuple[int, int] = TACTILE_MOTION_RESIZE,
+) -> list[np.ndarray]:
+    """
+    Format single-panel tactile frames as [tactile|black|black] to match
+    the 3-panel layout used by motion_row and embeddings mode.
+    """
+    h, w = panel_size[1], panel_size[0]
+    black = np.zeros((h, w, 3), dtype=np.uint8)
+    result = []
+    for f in tactile_frames:
+        if f.shape[:2] != (h, w):
+            f = cv2.resize(f, (w, h), interpolation=cv2.INTER_AREA)
+        if f.ndim == 2:
+            f = np.stack([f] * 3, axis=-1)
+        row = np.concatenate([f, black, black], axis=1)
+        result.append(row)
+    return result
+
+
 def build_motion_row_frames(
     gt_tactile_frames: list[np.ndarray],
     pred_tactile_frames: list[np.ndarray] | None = None,
@@ -756,8 +810,10 @@ def generate_result_video(
                 linestyle="--" if sim_gt is not None else "-",
                 label=f"Pred: {short_label}" if sim_gt is not None else short_label,
             )
+            if sim_gt is not None and sim_gt.shape[0] > 0 and t < sim_gt.shape[0]:
+                ax.scatter([t], [sim_gt[t, j]], color=c, s=25, zorder=5, marker="o")
             if max_t > 0:
-                ax.scatter([t], [sim_matrix[t, j]], color=c, s=25, zorder=5)
+                ax.scatter([t], [sim_matrix[t, j]], color=c, s=25, zorder=5, marker="s" if sim_gt is not None else "o")
 
         ax.set_xlim(0, max(n_steps - 1, 1))
         ax.set_ylim(sim_min, sim_max)
@@ -813,10 +869,20 @@ def run_video_mode(args):
 
     for src_path, name in sources:
         print(f"\nProcessing: {src_path}")
-        if os.path.isdir(src_path):
+        if args.eval_video_format:
+            # Eval video: [gt|pred|diff] horizontal; extract tactile for encoding
+            raw_frames = load_frames_from_eval_video(src_path, extract="horizontal")
+            gt_frames = load_frames_from_eval_video(src_path, extract="gt_tactile")
+            pred_frames = load_frames_from_eval_video(src_path, extract="pred_tactile")
+            frames = gt_frames
+        elif os.path.isdir(src_path):
             frames = load_frames_from_directory(src_path)
+            raw_frames = None
+            pred_frames = None
         else:
             frames = load_frames_from_video(src_path)
+            raw_frames = None
+            pred_frames = None
 
         if len(frames) < args.num_frames:
             print(f"  Skip: need >= {args.num_frames} frames, got {len(frames)}")
@@ -829,10 +895,26 @@ def run_video_mode(args):
         sim_matrix = touch_embeds @ text_embeds.T
         print(f"  Touch embeds: {touch_embeds.shape}, similarity: {sim_matrix.shape}")
 
-        mean_sim = sim_matrix.mean(axis=0)
-        print("  Mean similarity per text:")
-        for j, t in enumerate(texts):
-            print(f"    [{j}] {t}: {mean_sim[j]:.4f}")
+        sim_gt = None
+        if args.eval_video_format and pred_frames is not None and len(pred_frames) >= args.num_frames:
+            pred_windows = preprocess_frames(pred_frames, None, args.num_frames, args.frame_stride)
+            pred_embeds = extract_tactile_embeddings(
+                tactile_model, pred_windows, sensor_id, device, args.aggregate
+            )
+            sim_pred = pred_embeds @ text_embeds.T
+            sim_gt = sim_matrix
+            sim_matrix = sim_pred
+            print(f"  GT/Pred similarity: {sim_gt.shape}, {sim_pred.shape}")
+            mean_gt = sim_gt.mean(axis=0)
+            mean_pred = sim_pred.mean(axis=0)
+            print("  Mean similarity per text (GT / Pred):")
+            for j, t in enumerate(texts):
+                print(f"    [{j}] {t}: {mean_gt[j]:.4f} / {mean_pred[j]:.4f}")
+        else:
+            mean_sim = sim_matrix.mean(axis=0)
+            print("  Mean similarity per text:")
+            for j, t in enumerate(texts):
+                print(f"    [{j}] {t}: {mean_sim[j]:.4f}")
 
         # Frames per window (last frame of each window) for video
         subsampled = frames[::args.frame_stride]
@@ -842,27 +924,106 @@ def run_video_mode(args):
             last_idx = min((t + args.num_frames - 1) * args.frame_stride, len(frames) - 1)
             frames_per_window.append(frames[last_idx])
 
+        motion_row_frames = None
+        frames_for_video = frames_per_window
+        if args.save_video:
+            if args.eval_video_format and raw_frames is not None:
+                # Eval format: use horizontal [gt|pred|diff] for display, gt+pred for motion
+                frames_for_video = []
+                for t in range(n_windows):
+                    idx = min(int(t * len(raw_frames) / max(n_windows, 1)), len(raw_frames) - 1)
+                    frames_for_video.append(raw_frames[idx])
+                gt_tactile = extract_tactile_from_horizontal_frames(frames_for_video, panel="gt")
+                pred_tactile = extract_tactile_from_horizontal_frames(frames_for_video, panel="pred")
+                motion_row_frames = build_motion_row_frames(
+                    gt_tactile,
+                    pred_tactile_frames=pred_tactile,
+                    arrow_scale=3.0,
+                )
+            else:
+                # Raw tactile: [tactile|black|black] + motion on single source
+                tactile_for_motion = [_normalize_tactile_for_markertracker(f) for f in frames_per_window]
+                motion_row_frames = build_motion_row_frames(
+                    tactile_for_motion,
+                    pred_tactile_frames=None,
+                    arrow_scale=3.0,
+                )
+                frames_for_video = build_three_panel_row_frames(
+                    tactile_for_motion,
+                    panel_size=TACTILE_MOTION_RESIZE,
+                )
+
+        rgb_frames = None
+        if args.save_video and args.hdf5_path:
+            traj_id = parse_trajectory_id_from_video_path(src_path)
+            if traj_id:
+                try:
+                    rgb_frames = load_rgb_frames_from_hdf5(
+                        args.hdf5_path,
+                        traj_id,
+                        num_frames=n_windows,
+                        start_idx=args.hdf5_start_idx,
+                    )
+                    if len(rgb_frames) != n_windows:
+                        rgb_frames = [
+                            rgb_frames[min(int(t * len(rgb_frames) / max(n_windows, 1)), len(rgb_frames) - 1)]
+                            for t in range(n_windows)
+                        ]
+                except (KeyError, OSError) as e:
+                    print(f"  Warning: could not load RGB from HDF5: {e}")
+            else:
+                print(f"  Warning: could not parse trajectory_id from {src_path} (use episode_X_traj_Y.mp4 naming for HDF5 RGB)")
+
         if args.save_csv:
             import csv
             csv_path = os.path.join(args.output_dir, f"{name}_similarity.csv")
             with open(csv_path, "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["window_idx"] + [f'"{t}"' for t in texts])
-                for i, row in enumerate(sim_matrix):
-                    w.writerow([i] + list(row))
+                if sim_gt is not None:
+                    cols = ["window_idx"]
+                    for txt in texts:
+                        cols.append(f'"{txt}" (gt)')
+                    for txt in texts:
+                        cols.append(f'"{txt}" (pred)')
+                    w.writerow(cols)
+                    n_rows = max(sim_gt.shape[0], sim_matrix.shape[0])
+                    for i in range(n_rows):
+                        row = [i]
+                        if i < sim_gt.shape[0]:
+                            row.extend(sim_gt[i].tolist())
+                        else:
+                            row.extend([""] * len(texts))
+                        if i < sim_matrix.shape[0]:
+                            row.extend(sim_matrix[i].tolist())
+                        else:
+                            row.extend([""] * len(texts))
+                        w.writerow(row)
+                else:
+                    w.writerow(["window_idx"] + [f'"{t}"' for t in texts])
+                    for i, row in enumerate(sim_matrix):
+                        w.writerow([i] + list(row))
             print(f"  Saved {csv_path}")
 
         if args.save_plot:
             plot_path = os.path.join(args.output_dir, f"{name}_similarity.png")
-            plot_similarity(sim_matrix, texts, plot_path, title=f"Tactile-Text Similarity — {name}")
+            if sim_gt is not None:
+                plot_similarity_gt_pred(
+                    sim_gt, sim_matrix, texts, plot_path,
+                    title=f"Tactile-Text Similarity (GT vs Pred) — {name}",
+                )
+            else:
+                plot_similarity(sim_matrix, texts, plot_path, title=f"Tactile-Text Similarity — {name}")
 
         if args.save_video:
             video_out = os.path.join(args.output_dir, f"{name}_result.mp4")
             generate_result_video(
-                sim_matrix, texts, frames_per_window,
+                sim_matrix, texts, frames_for_video,
                 output_path=video_out,
                 fps=args.video_fps,
                 title=f"Tactile-Text Similarity — {name}",
+                sim_gt=sim_gt,
+                motion_row_frames=motion_row_frames,
+                rgb_frames=rgb_frames,
             )
 
 
@@ -1071,8 +1232,8 @@ def parse_args():
 
     # Video mode
     p.add_argument("--video_path", type=str, default=None,
-                   help="Video file, directory of frames, or glob (tactile-only, no crop)")
-    p.add_argument("--sensor", type=str, default="digit", choices=list(SENSOR_NAME_TO_ID.keys()))
+                   help="Video file, directory of videos (runs each .mp4/.avi etc), or glob (tactile-only, no crop)")
+    p.add_argument("--sensor", type=str, default="gelsight_mini", choices=list(SENSOR_NAME_TO_ID.keys()))
     p.add_argument("--num_frames", type=int, default=4)
     p.add_argument("--stride", type=int, default=2)
     p.add_argument("--frame_stride", type=int, default=1)
@@ -1090,7 +1251,7 @@ def parse_args():
     p.add_argument("--video_dir", type=str, default=None,
                    help="Dir with per-episode videos: {video_dir}/{name}.mp4 (embeddings mode)")
     p.add_argument("--eval_video_format", action="store_true",
-                   help="Video is from eval_dino_wm_tactile (gt|pred|diff stacked vertically). Use when attaching eval output videos.")
+                   help="Video is from eval_dino_wm_tactile (gt|pred|diff). Applies to both video and embeddings mode.")
     p.add_argument("--hdf5_path", type=str, default=None,
                    help="Consolidated HDF5 path for RGB row and tactile motion (camera_0/1 for RGB, camera_2 for motion arrows). Use this when video compression corrupts tactile markers.")
     p.add_argument("--hdf5_start_idx", type=int, default=0,

@@ -8,6 +8,7 @@ MSE loss. Optionally saves gt/pred/diff videos to wandb and/or gt/pred embedding
 
 import argparse
 import os
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -25,7 +26,7 @@ except ImportError:
     HAS_WANDB = False
 
 from tactile_dataset import TactileTrajectoryDataset, CAMERA_CONFIG, load_full_episode
-from dino_models import TactileVideoTransformer, normalize_acs
+from dino_models import TactileVideoTransformer, normalize_acs, normalize_states
 from dino_decoder import VQVAE
 
 # DINOv3 ViT-B/16: 196 patches (14x14), 768 dim. AnyTouch: 512 dim.
@@ -153,10 +154,12 @@ def create_episode_videos(
 
         # Build full episode tensors (sliced from start_idx)
         states = torch.tensor(ep_data["states"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
+        if args.normalize_states:
+            states = normalize_states(states, device, args.norm_stats_path)
         actions = torch.tensor(ep_data["actions"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
         if actions.shape[-1] > 7:
             actions = actions[..., :7]
-        actions = normalize_acs(actions, device)
+        actions = normalize_acs(actions, device, norm_stats_path=args.norm_stats_path)
 
         # Pre-load all embeddings for condition cameras (for GT resets)
         all_embds = {}
@@ -278,150 +281,53 @@ def create_episode_videos(
 
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Evaluate trained DINO world model on tactile dataset (autoregressive rollout + decoder)"
-    )
-    p.add_argument(
-        "--wm_checkpoint",
-        type=str,
-        required=True,
-        help="Path to world model checkpoint (.pth)",
-    )
-    p.add_argument(
-        "--decoder_dir",
-        type=str,
-        required=True,
-        help="Directory with decoder checkpoints (decoder_camera_0_camera_1.pth, decoder_camera_2.pth)",
-    )
-    p.add_argument(
-        "--hdf5_path",
-        type=str,
-        required=True,
-        help="Path to consolidated HDF5 or directory with .hdf5 files",
-    )
-    p.add_argument(
-        "--cameras",
-        type=str,
-        default="camera_0,camera_1,camera_2",
-        help="Comma-separated cameras (must match world model training)",
-    )
-    p.add_argument(
-        "--condition_cameras",
-        type=str,
-        default=None,
-        help="Cameras to condition on (default: same as --cameras)",
-    )
-    p.add_argument(
-        "--predict_cameras",
-        type=str,
-        default=None,
-        help="Cameras to predict (default: same as --cameras)",
-    )
-    p.add_argument(
-        "--segment_length",
-        type=int,
-        default=4,
-        help="Segment length used during world model training (BL)",
-    )
-    p.add_argument(
-        "--batch_size",
-        type=int,
-        default=16,
-    )
-    p.add_argument(
-        "--num_test",
-        type=int,
-        default=100,
-        help="Number of trajectories for test split",
-    )
-    p.add_argument(
-        "--device",
-        type=str,
-        default="cuda:0",
-    )
-    p.add_argument(
-        "--output_dir",
-        type=str,
-        default=None,
-        help="If set, save sample gt/pred image pairs",
-    )
-    p.add_argument(
-        "--num_samples",
-        type=int,
-        default=8,
-    )
-    p.add_argument(
-        "--no_consolidated",
-        action="store_true",
-        help="hdf5_path is a directory of individual .hdf5 files",
-    )
-    p.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-    p.add_argument(
-        "--wandb",
-        action="store_true",
-        help="Log results and videos to Weights & Biases",
-    )
-    p.add_argument(
-        "--wandb_project",
-        type=str,
-        default="dino-wm-tactile",
-    )
-    p.add_argument(
-        "--wandb_run_name",
-        type=str,
-        default=None,
-    )
-    p.add_argument(
-        "--num_episode_videos",
-        type=int,
-        default=3,
-        help="Number of full episodes to log as gt/pred/diff videos",
-    )
-    p.add_argument(
-        "--max_episode_len",
-        type=int,
-        default=100,
-        help="Max timesteps per episode video",
-    )
-    p.add_argument(
-        "--video_fps",
-        type=int,
-        default=10,
-    )
-    p.add_argument(
-        "--start_after_gripper_close",
-        action="store_true",
-        help="For episode videos, only show frames after the gripper has closed",
-    )
-    p.add_argument(
-        "--gripper_idx",
-        type=int,
-        default=6,
-        help="Action dimension index for gripper (default 6 for 7-dim actions)",
-    )
-    p.add_argument(
-        "--gripper_closed_threshold",
-        type=float,
-        default=-0.5,
-        help="Gripper is closed when action[gripper_idx] <= this (default -0.5 for [-1,1] scale)",
-    )
-    p.add_argument(
-        "--chunk_size",
-        type=int,
-        default=8,
-        help="Number of steps to predict in the chunk before resetting to GT (default 8)",
-    )
-    p.add_argument(
-        "--save_embeds",
-        action="store_true",
-        help="Save ground truth and predicted embeddings to disk (uses --output_dir or ./eval_embeds)",
-    )
+    import sys
+    from config import load_config
 
-    return p.parse_args()
+    config_path = str(Path(__file__).parent / "configs" / "default.yaml")
+    if "--config" in sys.argv:
+        idx = sys.argv.index("--config")
+        if idx + 1 < len(sys.argv):
+            config_path = sys.argv[idx + 1]
+    cfg = load_config("eval_wm", config_path)
+
+    p = argparse.ArgumentParser(
+        description="Evaluate DINO world model (see configs/default.yaml)"
+    )
+    p.add_argument("--config", type=str, default=config_path)
+    p.add_argument("--wm_checkpoint", type=str, required=True)
+    p.add_argument("--decoder_dir", type=str, required=True)
+    p.add_argument("--hdf5_path", type=str, required=True)
+    p.add_argument("--norm_stats_json", type=str, default=None)
+    p.add_argument("--cameras", type=str, default=cfg.get("cameras", "camera_0,camera_1,camera_2"))
+    p.add_argument("--condition_cameras", type=str, default=None)
+    p.add_argument("--predict_cameras", type=str, default=None)
+    p.add_argument("--segment_length", type=int, default=cfg.get("segment_length", 4))
+    p.add_argument("--batch_size", type=int, default=cfg.get("batch_size", 16))
+    p.add_argument("--num_test", type=int, default=cfg.get("num_test", 100))
+    p.add_argument("--device", type=str, default=cfg.get("device", "cuda:0"))
+    p.add_argument("--output_dir", type=str, default=None)
+    p.add_argument("--num_samples", type=int, default=cfg.get("num_samples", 8))
+    p.add_argument("--no_consolidated", action="store_true")
+    p.add_argument("--seed", type=int, default=cfg.get("seed", 42))
+    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb_project", type=str, default=cfg.get("wandb_project", "dino-wm-tactile"))
+    p.add_argument("--wandb_run_name", type=str, default=None)
+    p.add_argument("--num_episode_videos", type=int, default=cfg.get("num_episode_videos", 3))
+    p.add_argument("--max_episode_len", type=int, default=cfg.get("max_episode_len", 100))
+    p.add_argument("--video_fps", type=int, default=cfg.get("video_fps", 10))
+    p.add_argument("--start_after_gripper_close", action="store_true")
+    p.add_argument("--gripper_idx", type=int, default=cfg.get("gripper_idx", 6))
+    p.add_argument("--gripper_closed_threshold", type=float, default=cfg.get("gripper_closed_threshold", -0.5))
+    p.add_argument("--chunk_size", type=int, default=cfg.get("chunk_size", 8))
+    p.add_argument("--save_embeds", action="store_true")
+    p.add_argument("--normalize_states", action="store_true", help="Use when model was trained with --normalize_states")
+    p.set_defaults(normalize_states=cfg.get("normalize_states", False))
+
+    args = p.parse_args()
+    hdf5_dir = args.hdf5_path if os.path.isdir(args.hdf5_path) else os.path.dirname(os.path.abspath(args.hdf5_path))
+    args.norm_stats_path = args.norm_stats_json or os.path.join(hdf5_dir, "norm_stats.json")
+    return args
 
 
 def main():
@@ -493,8 +399,9 @@ def main():
     wandb_images = {} if (args.wandb and HAS_WANDB) else None
 
     if args.wandb and HAS_WANDB:
+        from config import get_wandb_config
         run_name = args.wandb_run_name or f"eval_wm_{'+'.join(cameras)}"
-        wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
+        wandb.init(project=args.wandb_project, name=run_name, config=get_wandb_config("eval_wm", args))
 
     # with torch.no_grad():
     #     for data in tqdm(eval_loader, desc="Evaluating"):

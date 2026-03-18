@@ -20,7 +20,7 @@ from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 from torchvision import transforms
 import torchvision.transforms.functional as TF
-
+import json
 # Tactile preprocessing constants (from AnyTouch infer_touch_text_similarity.py)
 OFFSET = 130.0 / 255.0
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
@@ -238,6 +238,7 @@ def preprocess(
     sensor: str = "digit",
     num_tactile_frames: int = 4,
     device: str = "cuda:0",
+    output_json_file: str = None,
 ):
     # dino = torch.hub.load('/home/yilin/Projects/flow_policy/git-packages/dinov3', 
     # 'dinov3_vitb16', source='local', weights = '/home/yilin/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth').to(device)
@@ -256,7 +257,7 @@ def preprocess(
 
     all_acs = []
     transitions = 0
-
+    all_states = []
     for i, hdf5_file in tqdm(enumerate(hdf5_files), desc="Loading expert data",
                               total=len(hdf5_files), ncols=0, leave=False):
         with h5py.File(hdf5_file, "r+") as f:
@@ -355,12 +356,102 @@ def preprocess(
                 data_group.create_dataset("states", data=np.stack(states))
 
             all_acs.extend(actions)
+            all_states.extend(states)
             transitions += len(actions)
 
     all_acs = np.array(all_acs)
+    all_states = np.array(all_states)
+    assert all_states.shape[0] == all_acs.shape[0], "Number of states and actions must match"
     print('max', np.max(all_acs, axis=0))
     print('min', np.min(all_acs, axis=0))
     print('total transitions:', transitions)
+    max_acs, min_acs, total_transitions, num_trajs = np.max(all_acs, axis=0), np.min(all_acs, axis=0), transitions, i+1
+    mean_acs = np.mean(all_acs, axis=0)
+    std_acs = np.std(all_acs, axis=0)
+    info = {'max_acs': max_acs.tolist(), 'min_acs': min_acs.tolist(), 'mean_acs': mean_acs.tolist(), 'std_acs':std_acs.tolist(), 'num_transitions': int(total_transitions), 'num_trajectories': int(num_trajs)}
+    ## also computing the states stats
+    max_states, min_states, total_transitions, num_trajs = np.max(all_states, axis=0), np.min(all_states, axis=0), transitions, i+1
+    mean_states = np.mean(all_states, axis=0)
+    std_states = np.std(all_states, axis=0)
+    info['max_states'] = max_states.tolist()
+    info['min_states'] = min_states.tolist()
+    info['mean_states'] = mean_states.tolist()
+    info['std_states'] = std_states.tolist()
+    with open(output_json_file, "w") as f:
+        json.dump(info, f)  # indent=4 makes it pretty-printed
+
+
+
+def compute_norm_stats_only(
+    consolidated_hdf5_path: str,
+    output_json_file: str,
+):
+    """Compute action/state norm stats from an already consolidated HDF5 file."""
+    with h5py.File(consolidated_hdf5_path, "r") as hf:
+        traj_ids = [k for k in hf.keys() if k.startswith("trajectory_")]
+    traj_ids.sort()
+
+    all_acs = []
+    all_states = []
+    transitions = 0
+    num_trajs = 0
+    with h5py.File(consolidated_hdf5_path, "r") as hf:
+        for traj_id in tqdm(traj_ids, desc="Computing norm stats", ncols=0):
+            traj = hf[traj_id]
+            if "actions" not in traj:
+                print(f"Skipping {traj_id}: no actions")
+                continue
+            if "ee_states" not in traj or "gripper_states" not in traj:
+                print(f"Skipping {traj_id}: no ee_states or gripper_states")
+                continue
+
+            actions = traj["actions"][...]
+            ee_states = traj["ee_states"][...]
+            gripper_states = traj["gripper_states"][...]
+            T = len(actions)
+
+            for t in range(T):
+                ee_state = eef_pose_to_state(ee_states[t].reshape(4, 4).T, gripper_states[t])
+                all_states.append(ee_state)
+            all_acs.extend(actions)
+            transitions += T
+            num_trajs += 1
+
+    if not all_acs or not all_states:
+        raise ValueError("No valid trajectories found; all files were skipped or empty")
+
+    all_acs = np.array(all_acs)
+    all_states = np.array(all_states)
+    assert all_states.shape[0] == all_acs.shape[0], "Number of states and actions must match"
+
+    print("max", np.max(all_acs, axis=0))
+    print("min", np.min(all_acs, axis=0))
+    print("total transitions:", transitions)
+
+    max_acs = np.max(all_acs, axis=0)
+    min_acs = np.min(all_acs, axis=0)
+    mean_acs = np.mean(all_acs, axis=0)
+    std_acs = np.std(all_acs, axis=0)
+    max_states = np.max(all_states, axis=0)
+    min_states = np.min(all_states, axis=0)
+    mean_states = np.mean(all_states, axis=0)
+    std_states = np.std(all_states, axis=0)
+
+    info = {
+        "max_acs": max_acs.tolist(),
+        "min_acs": min_acs.tolist(),
+        "mean_acs": mean_acs.tolist(),
+        "std_acs": std_acs.tolist(),
+        "max_states": max_states.tolist(),
+        "min_states": min_states.tolist(),
+        "mean_states": mean_states.tolist(),
+        "std_states": std_states.tolist(),
+        "num_transitions": int(transitions),
+        "num_trajectories": num_trajs,
+    }
+    with open(output_json_file, "w") as f:
+        json.dump(info, f, indent=2)
+    print(f"Norm stats saved to {output_json_file}")
 
 
 def convert_hdf5_to_consolidated_hdf5(hdf5_dirs: list[str], output_hdf5_file: str):
@@ -405,47 +496,55 @@ def convert_hdf5_to_consolidated_hdf5(hdf5_dirs: list[str], output_hdf5_file: st
 
 def parse_args():
     p = argparse.ArgumentParser(description="HDF5 to dataset with DINO (camera_0/1) + AnyTouch (camera_2)")
-    p.add_argument("--hdf5_dir", type=str, nargs="+", required=True,
-                  help="Directory (or directories) with trajectory HDF5 files")
+    p.add_argument("--hdf5_dir", type=str, nargs="+", default=None,
+                  help="Directory (or directories) with trajectory HDF5 files (required unless --norm_stats_only)")
+    p.add_argument("--input_hdf5", type=str, default=None,
+                  help="Consolidated HDF5 path (required for --norm_stats_only)")
     p.add_argument("--output_hdf5", type=str, default=None,
                   help="Output consolidated HDF5 path (default: first hdf5_dir/consolidated.h5)")
+    p.add_argument("--output_json", type=str, default=None,
+                  help="Output JSON path for norm stats")
     # p.add_argument("--anytouch_path", type=str, default=None,
     #               help="Path to AnyTouch2 repo (default: $ANYTOUCH_PATH or ../AnyTouch2)")
-    p.add_argument("--checkpoint", type=str, required=True,
-                  help="Path to AnyTouch checkpoint (e.g. checkpoints/checkpoint-4frames.pth)")
+    p.add_argument("--checkpoint", type=str, default=None,
+                  help="Path to AnyTouch checkpoint (required unless --norm_stats_only)")
     p.add_argument("--sensor", type=str, default="digit",
                   choices=list(SENSOR_NAME_TO_ID.keys()))
     p.add_argument("--num_tactile_frames", type=int, default=4)
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--skip_consolidate", action="store_true",
                   help="Skip consolidation step")
+    p.add_argument("--norm_stats_only", action="store_true",
+                  help="Only compute action/state norm stats; skip embedding encoding and consolidation")
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
 
-    # anytouch_path = args.anytouch_path or os.environ.get("ANYTOUCH_PATH")
-    # if not anytouch_path:
-    #     # Try relative to this script
-    #     anytouch_path = os.path.abspath(
-    #         os.path.join(os.path.dirname(__file__), "..", "..", "AnyTouch2")
-    #     )
-    # if not os.path.isdir(anytouch_path):
-    #     raise FileNotFoundError(
-    #         f"AnyTouch2 repo not found at {anytouch_path}. "
-    #         "Set ANYTOUCH_PATH or pass --anytouch_path."
-    #     )
+    if args.norm_stats_only:
+        if not args.input_hdf5:
+            raise ValueError("--input_hdf5 required for --norm_stats_only (path to consolidated HDF5)")
+        output_json = args.output_json or os.path.join(
+            os.path.dirname(os.path.abspath(args.input_hdf5)), "norm_stats.json"
+        )
+        compute_norm_stats_only(args.input_hdf5, output_json)
+    else:
+        if not args.hdf5_dir:
+            raise ValueError("--hdf5_dir required (omit --norm_stats_only to run full pipeline)")
+        if not args.checkpoint:
+            raise ValueError("--checkpoint required unless --norm_stats_only")
 
-    preprocess(
-        args.hdf5_dir,
-        # anytouch_path=anytouch_path,
-        checkpoint_path=args.checkpoint,
-        sensor=args.sensor,
-        num_tactile_frames=args.num_tactile_frames,
-        device=args.device,
-    )
+        output_json = args.output_json or os.path.join(args.hdf5_dir[0], "norm_stats.json")
+        preprocess(
+            args.hdf5_dir,
+            checkpoint_path=args.checkpoint,
+            sensor=args.sensor,
+            num_tactile_frames=args.num_tactile_frames,
+            device=args.device,
+            output_json_file=output_json,
+        )
 
-    if not args.skip_consolidate:
-        output_path = args.output_hdf5 or os.path.join(args.hdf5_dir[0], "consolidated.h5")
-        convert_hdf5_to_consolidated_hdf5(args.hdf5_dir, output_path)
+        if not args.skip_consolidate:
+            output_path = args.output_hdf5 or os.path.join(args.hdf5_dir[0], "consolidated.h5")
+            convert_hdf5_to_consolidated_hdf5(args.hdf5_dir, output_path)

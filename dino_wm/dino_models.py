@@ -2,6 +2,9 @@
 
 
 
+import json
+import os
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -10,6 +13,89 @@ from einops.layers.torch import Rearrange
 from typing import Tuple, Optional, List, Dict
 from torchvision import transforms
 from scipy.spatial.transform import Rotation
+
+# Fallback when norm_stats_path not provided (backward compatibility)
+_DEFAULT_MAX_AC = [0.89928758, 0.71893158, 0.69869383, 0.32456627, 0.51343921, 0.28401476, 1.0]
+_DEFAULT_MIN_AC = [-0.78933347, -1.0, -0.95038878, -0.3243517, -0.30636792, -0.30071826, -1.0]
+
+
+def load_action_norm_stats(norm_stats_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Load min_acs and max_acs from norm_stats.json. Returns (min_ac, max_ac) tensors."""
+    with open(norm_stats_path) as f:
+        info = json.load(f)
+    print(f"Loaded action norm stats: {info}")
+    min_ac = torch.tensor(info["min_acs"], dtype=torch.float32)
+    max_ac = torch.tensor(info["max_acs"], dtype=torch.float32)
+    return min_ac, max_ac
+
+
+def load_state_norm_stats(norm_stats_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Load min_states and max_states from norm_stats.json. Returns (min_state, max_state) tensors."""
+    with open(norm_stats_path) as f:
+        info = json.load(f)
+    min_s = torch.tensor(info["min_states"], dtype=torch.float32)
+    max_s = torch.tensor(info["max_states"], dtype=torch.float32)
+    return min_s, max_s
+
+
+def normalize_states(states, device="cuda:0", norm_stats_path: Optional[str] = None):
+    """Normalize states to [0, 1] using min/max from norm_stats.json."""
+    if not norm_stats_path or not os.path.isfile(norm_stats_path):
+        return states
+    min_s, max_s = load_state_norm_stats(norm_stats_path)
+    print(f"Min states: {min_s}, Max states: {max_s}")
+    min_s = min_s.to(device)
+    max_s = max_s.to(device)
+    state_dim = states.shape[-1]
+    min_s = min_s[:state_dim]
+    max_s = max_s[:state_dim]
+    return (states - min_s) / (max_s - min_s).clamp(min=1e-6)
+
+
+def unnormalize_states(states, device="cuda:0", norm_stats_path: Optional[str] = None):
+    """Unnormalize states from [0, 1] back to original scale."""
+    if not norm_stats_path or not os.path.isfile(norm_stats_path):
+        return states
+    min_s, max_s = load_state_norm_stats(norm_stats_path)
+    min_s = min_s.to(device)
+    max_s = max_s.to(device)
+    state_dim = states.shape[-1]
+    min_s = min_s[:state_dim]
+    max_s = max_s[:state_dim]
+    return states * (max_s - min_s) + min_s
+
+
+def normalize_acs(acs, device="cuda:0", norm_stats_path: Optional[str] = None):
+    """Normalize actions to [0, 1] using min/max from norm_stats.json or hard-coded defaults."""
+    if norm_stats_path and os.path.isfile(norm_stats_path):
+        min_ac, max_ac = load_action_norm_stats(norm_stats_path)
+    else:
+        min_ac = torch.tensor(_DEFAULT_MIN_AC, dtype=torch.float32)
+        max_ac = torch.tensor(_DEFAULT_MAX_AC, dtype=torch.float32)
+    min_ac = min_ac.to(device)
+    max_ac = max_ac.to(device)
+    # Truncate to action dim if acs has fewer dims (e.g. 7)
+    ac_dim = acs.shape[-1]
+    min_ac = min_ac[:ac_dim]
+    max_ac = max_ac[:ac_dim]
+    norm_acs = (acs - min_ac) / (max_ac - min_ac).clamp(min=1e-6)
+    return norm_acs
+
+
+def unnormalize_acs(acs, device="cuda:0", norm_stats_path: Optional[str] = None):
+    """Unnormalize actions from [0, 1] back to original scale using norm_stats.json or defaults."""
+    if norm_stats_path and os.path.isfile(norm_stats_path):
+        min_ac, max_ac = load_action_norm_stats(norm_stats_path)
+    else:
+        min_ac = torch.tensor(_DEFAULT_MIN_AC, dtype=torch.float32)
+        max_ac = torch.tensor(_DEFAULT_MAX_AC, dtype=torch.float32)
+    min_ac = min_ac.to(device)
+    max_ac = max_ac.to(device)
+    ac_dim = acs.shape[-1]
+    min_ac = min_ac[:ac_dim]
+    max_ac = max_ac[:ac_dim]
+    acs = acs * (max_ac - min_ac) + min_ac
+    return acs
 
 
 def batch_quat_to_rotvec(quaternions):
@@ -49,22 +135,6 @@ def batch_rotvec_to_quat(rotvecs):
     r = Rotation.from_rotvec(rotvecs_np)
     quaternions = r.as_quat()
     return quaternions
-
-def normalize_acs(acs, device='cuda:0'):
-    max_ac = torch.tensor([0.89928758, 0.71893158, 0.69869383, 0.32456627, 0.51343921, 0.28401476, 1.        ]).to(device)
-    min_ac = torch.tensor([-0.78933347, -1.         ,-0.95038878, -0.3243517,  -0.30636792, -0.30071826 ,-1.        ]).to(device)
-    
-    norm_acs = (acs - min_ac) / (max_ac - min_ac)
-    
-    return norm_acs
-
-def unnormalize_acs(acs, device='cuda:0'):
-    max_ac = torch.tensor([0.89928758, 0.71893158, 0.69869383, 0.32456627, 0.51343921, 0.28401476, 1.        ]).to(device)
-    min_ac = torch.tensor([-0.78933347, -1.         ,-0.95038878, -0.3243517,  -0.30636792, -0.30071826 ,-1.        ]).to(device)
-    
-    acs = (acs*(max_ac - min_ac)) + min_ac
-    
-    return acs
 
 class ResidualBlock2(nn.Module):
     def __init__(self, channels):
