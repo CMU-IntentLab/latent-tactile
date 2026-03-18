@@ -3,12 +3,13 @@ Evaluate a trained DINO world model on the tactile dataset.
 
 Loads full episodes, runs autoregressive rollout with the world model (conditioned on
 images/embeddings, states, actions), decodes predicted latents to images, and reports
-MSE loss. Optionally saves gt/pred/diff videos to wandb.
+MSE loss. Optionally saves gt/pred/diff videos to wandb and/or gt/pred embeddings to disk.
 """
 
 import argparse
 import os
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -163,7 +164,21 @@ def create_episode_videos(
             emb = torch.tensor(ep_data[f"{c}_embd"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
             all_embds[c] = ensure_patch_grid(emb, PATCH_SIDE_DINOV3)
 
+        # Pre-load GT embeddings for predict cameras (for save_embeds)
+        gt_embds_per_cam = {}
+        if args.save_embeds:
+            for c in predict_cameras:
+                emb = torch.tensor(ep_data[f"{c}_embd"][start_idx : start_idx + T], dtype=torch.float32, device=device)
+                emb = ensure_patch_grid(emb.unsqueeze(0), PATCH_SIDE_DINOV3).squeeze(0)
+                gt_embds_per_cam[c] = emb.cpu().numpy()
+
         pred_imgs = [[all_gt_imgs[i][t].copy() for t in range(T)] for i in range(len(predict_cameras))]
+        pred_embds_per_cam = {c: [] for c in predict_cameras} if args.save_embeds else None
+        if pred_embds_per_cam is not None:
+            # Pre-fill with GT for first H frames (context window, not predicted)
+            for c in predict_cameras:
+                for t in range(H):
+                    pred_embds_per_cam[c].append(gt_embds_per_cam[c][t])
 
         # Chunked autoregressive rollout: reset to GT state/frames every chunk
         # First chunk: 8 steps. Subsequent chunks: 8-16 steps (configurable).
@@ -200,6 +215,8 @@ def create_episode_videos(
                             pred_img = rearrange(pred_img, "(b t) c h w -> b t c h w", t=1)
                             pred_img = pred_img[0, 0].cpu().numpy().transpose(1, 2, 0)
                             pred_imgs[i][t_pred] = np.clip(pred_img, 0, 1)
+                        if pred_embds_per_cam is not None and cam in next_embds:
+                            pred_embds_per_cam[cam].append(next_embds[cam][0, 0].cpu().numpy())
 
                     # Roll context window forward
                     for c in condition_cameras:
@@ -226,8 +243,36 @@ def create_episode_videos(
             frames.append((np.clip(frame, 0, 1) * 255).astype(np.uint8))
 
         video = np.stack(frames, axis=0)
-        video = np.transpose(video, (0, 3, 1, 2))  # (T, C, H, W)
-        videos[f"episode_{ep_idx}"] = wandb.Video(video, fps=args.video_fps, format="mp4")
+        if args.wandb and HAS_WANDB:
+            video_wandb = np.transpose(video, (0, 3, 1, 2))  # (T, C, H, W)
+            videos[f"episode_{ep_idx}"] = wandb.Video(video_wandb, fps=args.video_fps, format="mp4")
+
+        # Save video to disk (same folder as embeds)
+        save_dir = args.output_dir or "./eval_embeds"
+        os.makedirs(save_dir, exist_ok=True)
+        video_path = os.path.join(save_dir, f"episode_{ep_idx}_traj_{traj_id}_result.mp4")
+        T_v, H_v, W_v, C_v = video.shape
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(video_path, fourcc, args.video_fps, (W_v, H_v))
+        for t in range(T_v):
+            writer.write(cv2.cvtColor(video[t], cv2.COLOR_RGB2BGR))
+        writer.release()
+        print(f"Saved video: {video_path}")
+
+        # Save GT and pred embeddings to disk
+        if args.save_embeds and pred_embds_per_cam is not None:
+            save_dir = args.output_dir or "./eval_embeds"
+            os.makedirs(save_dir, exist_ok=True)
+            gt_dict = {c: gt_embds_per_cam[c] for c in predict_cameras}
+            pred_dict = {
+                c: np.stack(pred_embds_per_cam[c], axis=0) for c in predict_cameras
+                if len(pred_embds_per_cam[c]) > 0
+            }
+            gt_path = os.path.join(save_dir, f"episode_{ep_idx}_traj_{traj_id}_gt_embeds.npz")
+            pred_path = os.path.join(save_dir, f"episode_{ep_idx}_traj_{traj_id}_pred_embeds.npz")
+            np.savez(gt_path, **gt_dict)
+            np.savez(pred_path, **pred_dict)
+            print(f"Saved embeds: {gt_path}, {pred_path}")
 
     return videos
 
@@ -369,6 +414,11 @@ def parse_args():
         type=int,
         default=8,
         help="Number of steps to predict in the chunk before resetting to GT (default 8)",
+    )
+    p.add_argument(
+        "--save_embeds",
+        action="store_true",
+        help="Save ground truth and predicted embeddings to disk (uses --output_dir or ./eval_embeds)",
     )
 
     return p.parse_args()
@@ -514,8 +564,11 @@ def main():
     # if args.output_dir:
     #     print(f"Saved {samples_saved} sample images to {args.output_dir}")
 
-    # Episode rollout videos
-    if args.wandb and HAS_WANDB and args.num_episode_videos > 0:
+    # Episode rollout videos (and optionally save embeddings)
+    if (args.wandb and HAS_WANDB and args.num_episode_videos > 0) or args.save_embeds:
+        num_episodes = max(args.num_episode_videos, 1) if args.save_embeds else args.num_episode_videos
+        orig_num = args.num_episode_videos
+        args.num_episode_videos = num_episodes
         episode_videos = create_episode_videos(
             transition=transition,
             decoders=decoders,
@@ -525,13 +578,15 @@ def main():
             args=args,
             device=device,
         )
-        wandb.log({
-            # "eval_mse_loss": mean_loss,
-            # **(wandb_images or {}),
-            **episode_videos,
-        })
+        args.num_episode_videos = orig_num
+        if args.wandb and HAS_WANDB and episode_videos:
+            wandb.log({
+                # "eval_mse_loss": mean_loss,
+                # **(wandb_images or {}),
+                **episode_videos,
+            })
     elif args.wandb and HAS_WANDB:
-        wandb.log({"eval_mse_loss": mean_loss, **(wandb_images or {})})
+        wandb.log({**(wandb_images or {})})
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from einops import rearrange
+from tqdm import tqdm
 from torchvision import models
 try:
     import wandb
@@ -326,7 +327,6 @@ def lpips_loss_fn(pred: torch.Tensor, target: torch.Tensor, device: torch.device
     pred = _ensure_rgb(pred)
     target = _ensure_rgb(target)
     if HAS_LPIPS:
-        # LPIPS expects [-1, 1]
         pred_n = pred * 2 - 1
         target_n = target * 2 - 1
         if pred_n.shape[-2:] != (224, 224):
@@ -493,8 +493,8 @@ def train_one_decoder(
 
     decoder = VQVAE(emb_dim=emb_dim).to(device)
     if args.compile and hasattr(torch, "compile"):
-        decoder = torch.compile(decoder, mode="reduce-overhead")
-        print("  Using torch.compile (mode=reduce-overhead)")
+        decoder = torch.compile(decoder, mode="default")
+        print("  Using torch.compile (mode=default)")
     decoder_for_save = getattr(decoder, "_orig_mod", decoder)
     params = list(decoder.parameters())
     optimizer = AdamW(params, lr=args.lr)
@@ -528,7 +528,8 @@ def train_one_decoder(
     if use_amp:
         print("  Using AMP (automatic mixed precision)")
 
-    for i in range(args.iters):
+    pbar = tqdm(range(args.iters), desc=f"[{group_name}]", unit="iter")
+    for i in pbar:
         # Refresh loaders when exhausted
         try:
             data = next(train_iter)
@@ -578,34 +579,34 @@ def train_one_decoder(
             # RAE: add adversarial loss with adaptive lambda (paper Sec 3, Table 12)
             # Per-camera discriminators to prevent mode collapse across different camera modalities
             if args.loss == "rae" and i >= args.adv_start_iter and discriminators is not None:
-            total_gan = 0.0
-            for cam in camera_group:
-                pred = preds_dict[cam]
-                target = targets_dict[cam]
-                disc = discriminators[cam]
-                pred_flat = _ensure_rgb(pred.reshape(-1, *pred.shape[2:]))
-                target_flat = _ensure_rgb(target.reshape(-1, *target.shape[2:]))
-                if pred_flat.shape[-2:] != (224, 224):
-                    pred_224 = nn.functional.interpolate(
-                        pred_flat, size=(224, 224), mode="bilinear", align_corners=False
-                    )
-                else:
-                    pred_224 = pred_flat
-                fake_score = disc(pred_224)
-                gan_loss_gen = -fake_score.mean()  # hinge: generator maximizes D(fake)
+                total_gan = 0.0
+                for cam in camera_group:
+                    pred = preds_dict[cam]
+                    target = targets_dict[cam]
+                    disc = discriminators[cam]
+                    pred_flat = _ensure_rgb(pred.reshape(-1, *pred.shape[2:]))
+                    target_flat = _ensure_rgb(target.reshape(-1, *target.shape[2:]))
+                    if pred_flat.shape[-2:] != (224, 224):
+                        pred_224 = nn.functional.interpolate(
+                            pred_flat, size=(224, 224), mode="bilinear", align_corners=False
+                        )
+                    else:
+                        pred_224 = pred_flat
+                    fake_score = disc(pred_224)
+                    gan_loss_gen = -fake_score.mean()  # hinge: generator maximizes D(fake)
 
-                L_rec_cam = compute_loss(pred, target, args)
-                grad_rec = torch.autograd.grad(
-                    L_rec_cam, pred, retain_graph=True, create_graph=False
-                )[0]
-                grad_gan = torch.autograd.grad(
-                    gan_loss_gen, pred, retain_graph=True, create_graph=False
-                )[0]
-                lam = (grad_rec.norm() / (grad_gan.norm() + 1e-8)).detach().clamp(0.01, 100)
-                total_gan = total_gan + lam * gan_loss_gen
-            total_gan = total_gan / len(camera_group)
-            loss_gan_val = total_gan.item()
-            total_loss = total_loss + args.gan_weight * total_gan
+                    L_rec_cam = compute_loss(pred, target, args)
+                    grad_rec = torch.autograd.grad(
+                        L_rec_cam, pred, retain_graph=True, create_graph=False
+                    )[0]
+                    grad_gan = torch.autograd.grad(
+                        gan_loss_gen, pred, retain_graph=True, create_graph=False
+                    )[0]
+                    lam = (grad_rec.norm() / (grad_gan.norm() + 1e-8)).detach().clamp(0.01, 100)
+                    total_gan = total_gan + lam * gan_loss_gen
+                total_gan = total_gan / len(camera_group)
+                loss_gan_val = total_gan.item()
+                total_loss = total_loss + args.gan_weight * total_gan
 
         if scaler is not None:
             scaler.scale(total_loss).backward()
@@ -668,15 +669,15 @@ def train_one_decoder(
                     log_dict[f"loss_disc_{cam}"] = val
             wandb.log(log_dict)
         if i % 50 == 0:
-            parts = [f"Loss: {total_loss.item():.4f}"]
+            postfix = {"loss": f"{total_loss.item():.4f}"}
             if args.loss == "rae":
-                parts.append(f"L1: {loss_l1_sum:.4f}")
-                parts.append(f"LPIPS: {loss_lpips_sum:.4f}")
+                postfix["l1"] = f"{loss_l1_sum:.4f}"
+                postfix["lpips"] = f"{loss_lpips_sum:.4f}"
                 if loss_gan_val is not None:
-                    parts.append(f"GAN: {loss_gan_val:.4f}")
+                    postfix["gan"] = f"{loss_gan_val:.4f}"
                 if loss_disc_val is not None:
-                    parts.append(f"D: {loss_disc_val:.4f}")
-            print(f"\r[{group_name}] Iter {i}, " + ", ".join(parts), end="", flush=True)
+                    postfix["D"] = f"{loss_disc_val:.4f}"
+            pbar.set_postfix(postfix)
 
         if i % 100 == 0:
             try:
@@ -750,13 +751,14 @@ def train_one_decoder(
                     "best_eval_adv": best_eval_adv,
                     **log_images,
                 })
-            print()
+            tqdm.write("")
             best_str = f"best: {best_eval:.4f}"
             if args.loss == "rae" and discriminators is not None:
                 best_str += f", best_adv: {best_eval_adv:.4f}"
-            print(f"  Eval Loss: {eval_loss:.4f} ({best_str})")
+            tqdm.write(f"  Eval Loss: {eval_loss:.4f} ({best_str})")
             decoder.train()
 
+    pbar.close()
     # Save last checkpoint
     os.makedirs(args.output_dir, exist_ok=True)
     base = f"decoder_{group_name.replace('+', '_')}_last"

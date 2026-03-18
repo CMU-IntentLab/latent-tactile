@@ -7,6 +7,13 @@ LCRL/policy/__pycache__/
 wandb/*
 eval*/
 checkpoints/*
+*mp4
+*png
+wm_tactile*/
+*eval/
+dinov3/*
+results/
+test*
 experiment_script/visualization/log/
 experiment_script/final_runs/log
 experiment_script/final_runs/data

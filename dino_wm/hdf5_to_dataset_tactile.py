@@ -239,9 +239,10 @@ def preprocess(
     num_tactile_frames: int = 4,
     device: str = "cuda:0",
 ):
-    dino = torch.hub.load('/home/yilin/Projects/flow_policy/git-packages/dinov3', 
-    'dinov3_vitb16', source='local', weights = '/home/yilin/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth').to(device)
-
+    # dino = torch.hub.load('/home/yilin/Projects/flow_policy/git-packages/dinov3', 
+    # 'dinov3_vitb16', source='local', weights = '/home/yilin/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth').to(device)
+    dino = torch.hub.load('/home/yilin/Projects/flow_policy/git-packages/dinov3',
+     'dinov3_vits16', source='local', weights = '/home/yilin/Projects/latent-tactile/dinov3/dinov3-vits16-pretrain-lvd1689m/dinov3_vits16_pretrain_lvd1689m-08c60483.pth').to(device)
     tactile_model, sensor_id = _load_tactile_model(
     checkpoint_path, sensor,
         num_frames=num_tactile_frames, device=device

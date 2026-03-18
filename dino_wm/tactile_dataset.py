@@ -8,6 +8,8 @@ Each trajectory has:
 - states, actions
 """
 
+import json
+import os
 import random
 
 import torch
@@ -70,6 +72,11 @@ class TactileTrajectoryDataset(Dataset):
         is_consolidated: bool = True,
         seed: int = 42,
         resize_to_224: bool = True,
+        segment_sampling: str = "uniform",
+        gripper_state_idx: int = -1,
+        gripper_change_weight: float = 5.0,
+        weight_source: str = "gripper_state",
+        gripper_change_json_path: str | None = None,
     ):
         """
         Args:
@@ -81,6 +88,17 @@ class TactileTrajectoryDataset(Dataset):
             is_consolidated: If True, hdf5_path is a single file. If False, it's a directory.
             seed: Random seed for train/test split shuffle (for reproducibility).
             resize_to_224: If True, resize images to 224x224. Default False keeps original size.
+            segment_sampling: "uniform" (default) or "weighted". Weighted samples more from
+                segments where gripper state range (max-min) > 0.01.
+            gripper_action_idx: Action dimension for gripper (default -1 = last).
+            gripper_state_idx: State dimension for gripper (default -1 = last).
+            gripper_change_weight: When weighted, segments with gripper change get this weight
+                vs 1.0 for others (default 5.0 = ~5x more likely to sample).
+            weight_source: "gripper_state" (default) = compute from states max-min > 0.01;
+                "gripper_change_json" = load indices from JSON and weight segments overlapping
+                [index_0±2] or [index_1±2].
+            gripper_change_json_path: Path to gripper_change.json (required when weight_source=
+                "gripper_change_json"). JSON format: [{"traj_id": "...", "high_diff_idxs": [i0, i1]}, ...]
         """
         self.hdf5_path = hdf5_path
         self.cameras = cameras
@@ -89,6 +107,11 @@ class TactileTrajectoryDataset(Dataset):
         self.num_test = num_test
         self.is_consolidated = is_consolidated
         self.resize_to_224 = resize_to_224
+        self.segment_sampling = segment_sampling
+        self.gripper_state_idx = gripper_state_idx
+        self.gripper_change_weight = gripper_change_weight
+        self.weight_source = weight_source
+        self.gripper_change_json_path = gripper_change_json_path
         self._hf = None  # Lazy-open persistent handle for consolidated mode
 
         for cam in cameras:
@@ -100,7 +123,6 @@ class TactileTrajectoryDataset(Dataset):
                 self.trajectory_ids = [k for k in hf.keys() if k.startswith("trajectory_")]
             self.trajectory_ids.sort()
         else:
-            import os
             all_files = [
                 os.path.join(hdf5_path, f)
                 for f in os.listdir(hdf5_path)
@@ -134,6 +156,122 @@ class TactileTrajectoryDataset(Dataset):
                     traj_len = dg["actions"].shape[0]
                     for start in range(0, traj_len - segment_length + 1, 1):
                         self.slice_indices.append((filepath, start))
+
+        self.segment_weights = None
+        if segment_sampling == "weighted":
+            self._compute_segment_weights()
+
+    def _get_traj_id_for_lookup(self, traj_id_or_path: str) -> str:
+        """Return traj_id for JSON lookup. For consolidated, it's traj_id; for non-consolidated, derive from path."""
+        if self.is_consolidated:
+            return traj_id_or_path
+        return os.path.splitext(os.path.basename(traj_id_or_path))[0]
+
+    def _compute_segment_weights(self):
+        """Dispatch to gripper_state or gripper_change_json weight computation."""
+        if self.weight_source == "gripper_change_json":
+            self._compute_segment_weights_from_json()
+        else:
+            self._compute_segment_weights_gripper_state()
+
+    def _compute_segment_weights_gripper_state(self):
+        """Compute weights: gripper_change_weight for segments with max-min > 0.01, else 1.0."""
+        weights = []
+
+        def _gripper_change(traj, start: int, end: int) -> float:
+            """Weight = gripper_change_weight if max-min > 0.01, else 1.0."""
+            threshold = 0.01
+            if "states" in traj:
+                states = np.array(traj["states"][start:end], dtype=np.float32)
+                if states.size > 0 and abs(self.gripper_state_idx) <= states.shape[-1]:
+                    gripper = states[:, self.gripper_state_idx]
+                    diff = float(np.max(gripper) - np.min(gripper))
+                    if diff > threshold:
+                        return self.gripper_change_weight
+            return 1.0
+
+        if self.is_consolidated:
+            with h5py.File(self.hdf5_path, "r") as hf:
+                for traj_id, start in self.slice_indices:
+                    traj = hf[traj_id]
+                    end = start + self.segment_length
+                    weights.append(_gripper_change(traj, start, end))
+        else:
+            for filepath, start in self.slice_indices:
+                with h5py.File(filepath, "r") as hf:
+                    traj = hf["data"] if "data" in hf else hf
+                    end = start + self.segment_length
+                    weights.append(_gripper_change(traj, start, end))
+
+        self.segment_weights = np.array(weights, dtype=np.float64)
+        n_weighted = int(np.sum(self.segment_weights > 1.0))
+        n_total = len(self.segment_weights)
+        print(
+            f"[TactileTrajectoryDataset] weighted sampling (gripper_state): {n_weighted}/{n_total} segments "
+            f"({100 * n_weighted / n_total:.1f}%) have gripper change (max-min > 0.01)"
+        )
+
+    def _compute_segment_weights_from_json(self):
+        """Compute weights from gripper_change.json: weight segments overlapping [index_0±2] or [index_1±2]."""
+        if not self.gripper_change_json_path or not os.path.isfile(self.gripper_change_json_path):
+            raise FileNotFoundError(
+                f"gripper_change_json_path must point to existing file when weight_source=gripper_change_json, "
+                f"got {self.gripper_change_json_path}"
+            )
+        with open(self.gripper_change_json_path) as f:
+            data = json.load(f)
+        # Build lookup: traj_id -> (index_0, index_1) from high_diff_idxs
+        traj_to_indices: dict[str, tuple[int, int]] = {}
+        for item in data:
+            tid = item["traj_id"]
+            idxs = item.get("high_diff_idxs", [])
+            if len(idxs) >= 2:
+                traj_to_indices[tid] = (int(idxs[0]), int(idxs[1]))
+            elif len(idxs) == 1:
+                traj_to_indices[tid] = (int(idxs[0]), int(idxs[0]))
+
+        def _overlaps(segment_start: int, segment_end: int, center: int) -> bool:
+            """Check if [center-2, center+2] overlaps with [segment_start, segment_end)."""
+            lo, hi = center - 2, center + 2
+            return segment_start <= hi and lo <= segment_end - 1
+
+        weights = []
+        for traj_id_or_path, start in self.slice_indices:
+            traj_id = self._get_traj_id_for_lookup(traj_id_or_path)
+            segment_end = start + self.segment_length
+            indices = traj_to_indices.get(traj_id)
+            if indices is None:
+                weights.append(1.0)
+                continue
+            index_0, index_1 = indices
+            if _overlaps(start, segment_end, index_0) or _overlaps(start, segment_end, index_1):
+                weights.append(self.gripper_change_weight)
+            else:
+                weights.append(1.0)
+
+        self.segment_weights = np.array(weights, dtype=np.float64)
+        n_weighted = int(np.sum(self.segment_weights > 1.0))
+        n_total = len(self.segment_weights)
+        print(
+            f"[TactileTrajectoryDataset] weighted sampling (gripper_change_json): {n_weighted}/{n_total} segments "
+            f"({100 * n_weighted / n_total:.1f}%) overlap [index_0±2] or [index_1±2]"
+        )
+
+    def get_sampler(self, num_samples: int | None = None):
+        """
+        Return a sampler for use with DataLoader when segment_sampling="weighted".
+        Returns None for uniform sampling (DataLoader will use shuffle=True).
+        """
+        if self.segment_sampling != "weighted" or self.segment_weights is None:
+            return None
+        from torch.utils.data import WeightedRandomSampler
+        n = len(self.slice_indices)
+        weights = torch.from_numpy(self.segment_weights)
+        return WeightedRandomSampler(
+            weights=weights,
+            num_samples=num_samples if num_samples is not None else n,
+            replacement=True,
+        )
 
     def __len__(self):
         return len(self.slice_indices)

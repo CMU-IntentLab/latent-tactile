@@ -98,6 +98,13 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--ar_loss_weight", type=float, default=0.5)
     p.add_argument(
+        "--ar_loss_mode",
+        type=str,
+        choices=["single", "multi_step"],
+        default="single",
+        help="AR loss mode: 'single' = 1 step ahead (default); 'multi_step' = sample k from 3-5, sum loss over steps 1..k (use --segment_length 6+ for k>2)",
+    )
+    p.add_argument(
         "--decoder_dir",
         type=str,
         default=None,
@@ -122,6 +129,32 @@ def parse_args():
         "--no_compile",
         action="store_true",
         help="Disable torch.compile (use if compilation causes issues)",
+    )
+    p.add_argument(
+        "--segment_sampling",
+        type=str,
+        choices=["uniform", "weighted"],
+        default="uniform",
+        help="Segment sampling: 'uniform' (default) or 'weighted' (favor segments with gripper change)",
+    )
+    p.add_argument(
+        "--gripper_change_weight",
+        type=float,
+        default=5.0,
+        help="When segment_sampling=weighted, segments with gripper change get this weight vs 1.0 (default 5)",
+    )
+    p.add_argument(
+        "--weight_source",
+        type=str,
+        choices=["gripper_state", "gripper_change_json"],
+        default="gripper_state",
+        help="When weighted: 'gripper_state' (max-min>0.01) or 'gripper_change_json' (overlap index_0/1±2)",
+    )
+    p.add_argument(
+        "--gripper_change_json_path",
+        type=str,
+        default=None,
+        help="Path to gripper_change.json (required when weight_source=gripper_change_json)",
     )
     return p.parse_args()
 
@@ -267,6 +300,8 @@ def main():
 
     if args.wandb and HAS_WANDB:
         wandb.init(project="dino-wm-tactile", name=f"wm_{'+'.join(cameras)}")
+        config = {**vars(args), "cameras": cameras, "condition_cameras": condition_cameras, "predict_cameras": predict_cameras}
+        wandb.config.update(config, allow_val_change=True)
 
     use_amp = True
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -286,6 +321,12 @@ def main():
     device = args.device
     is_consolidated = not args.no_consolidated
 
+    if args.segment_sampling == "weighted" and args.weight_source == "gripper_change_json":
+        if not args.gripper_change_json_path or not os.path.isfile(args.gripper_change_json_path):
+            raise FileNotFoundError(
+                "gripper_change_json_path must point to existing file when weight_source=gripper_change_json"
+            )
+
     train_ds = TactileTrajectoryDataset(
         args.hdf5_path,
         cameras=cameras,
@@ -294,6 +335,11 @@ def main():
         num_test=args.num_test,
         is_consolidated=is_consolidated,
         seed=args.seed,
+        segment_sampling=args.segment_sampling,
+        gripper_state_idx=-1,
+        gripper_change_weight=args.gripper_change_weight,
+        weight_source=args.weight_source,
+        gripper_change_json_path=args.gripper_change_json_path,
     )
     eval_ds = TactileTrajectoryDataset(
         args.hdf5_path,
@@ -314,16 +360,23 @@ def main():
         seed=args.seed,
     )
 
-    dl_kwargs = {
+    train_sampler = train_ds.get_sampler()
+    base_dl_kwargs = {
         "batch_size": args.batch_size,
-        "shuffle": True,
         "num_workers": args.num_workers,
         "pin_memory": args.num_workers > 0,
         "persistent_workers": args.num_workers > 0,
     }
-    train_loader = iter(DataLoader(train_ds, **dl_kwargs))
-    eval_loader = iter(DataLoader(eval_ds, **dl_kwargs))
-    imagine_dl_kwargs = {**dl_kwargs, "batch_size": 1}
+    train_dl_kwargs = {**base_dl_kwargs}
+    if train_sampler is not None:
+        train_dl_kwargs["sampler"] = train_sampler
+        train_dl_kwargs["shuffle"] = False
+    else:
+        train_dl_kwargs["shuffle"] = True
+    eval_dl_kwargs = {**base_dl_kwargs, "shuffle": True}
+    train_loader = iter(DataLoader(train_ds, **train_dl_kwargs))
+    eval_loader = iter(DataLoader(eval_ds, **eval_dl_kwargs))
+    imagine_dl_kwargs = {**base_dl_kwargs, "batch_size": 1, "shuffle": True}
     imagine_loader = iter(DataLoader(imagine_ds, **imagine_dl_kwargs))
 
     camera_dims = {c: CAMERA_EMB_DIMS.get(c, 768) for c in cameras}
@@ -372,11 +425,11 @@ def main():
         try:
             data = next(train_loader)
         except StopIteration:
-            train_loader = iter(DataLoader(train_ds, **dl_kwargs))
+            train_loader = iter(DataLoader(train_ds, **train_dl_kwargs))
             data = next(train_loader)
 
         # Build camera inputs: (B, T-1, N, D)
-        non_blocking = dl_kwargs.get("pin_memory", False)
+        non_blocking = base_dl_kwargs.get("pin_memory", False)
         camera_inputs = {}
         camera_outputs = {}
         for cam in cameras:
@@ -407,27 +460,67 @@ def main():
             for cam in predict_cameras:
                 loss_tf = loss_tf + nn.MSELoss()(preds[cam], camera_outputs[cam])
 
-        # Autoregressive loss (predict 2 steps ahead)
+        # Autoregressive loss
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
             detach_preds = {c: preds[c].detach() for c in predict_cameras}
             detach_pred_state = pred_state.detach()
 
-            ar_inputs = {}
-            for cam in condition_cameras:
-                first = camera_inputs[cam][:, [0]]
-                # Use predicted next frame if we predict this cam, else use GT
-                if cam in predict_cameras:
-                    next_frame = detach_preds[cam][:, [0]]
-                else:
-                    next_frame = camera_outputs[cam][:, [0]]
-                ar_inputs[cam] = torch.cat([first, next_frame], dim=1)
-            ar_states = torch.cat([data_state[:, [0]], detach_pred_state[:, [0]]], dim=1)
-            ar_acs = norm_acs[:, [0, 1]]
+            if args.ar_loss_mode == "single":
+                # Default: 1 step ahead - predict step 2 from step 0->1
+                ar_inputs = {}
+                for cam in condition_cameras:
+                    first = camera_inputs[cam][:, [0]]
+                    if cam in predict_cameras:
+                        next_frame = detach_preds[cam][:, [0]]
+                    else:
+                        next_frame = camera_outputs[cam][:, [0]]
+                    ar_inputs[cam] = torch.cat([first, next_frame], dim=1)
+                ar_states = torch.cat([data_state[:, [0]], detach_pred_state[:, [0]]], dim=1)
+                ar_acs = norm_acs[:, [0, 1]]
 
-            preds_ar, pred_state_ar = transition(ar_inputs, ar_states, ar_acs)
-            loss_ar = nn.MSELoss()(pred_state_ar[:, 1], data_state[:, 2])
-            for cam in predict_cameras:
-                loss_ar = loss_ar + nn.MSELoss()(preds_ar[cam][:, 1], camera_outputs[cam][:, 1])
+                preds_ar, pred_state_ar = transition(ar_inputs, ar_states, ar_acs)
+                loss_ar = nn.MSELoss()(pred_state_ar[:, 1], data_state[:, 2])
+                for cam in predict_cameras:
+                    loss_ar = loss_ar + nn.MSELoss()(preds_ar[cam][:, 1], camera_outputs[cam][:, 1])
+            else:
+                # multi_step: sample k from 3-5, rollout k steps, sum loss over steps 1..k
+                k = random.randint(3, 5)
+                # segment has frames 0..segment_length-1; we need GT for frames 2..k+1
+                max_k = data_state.shape[1] - 2  # need data_state[:, step+1] and camera_outputs[:, step]
+                k = min(k, max(1, max_k))
+                if k < 1:
+                    loss_ar = torch.tensor(0.0, device=device)
+                else:
+                    # Start with frames [0, 1] (use pred for frame 1 if we predict it, else GT)
+                    cur_inputs = {}
+                    for cam in condition_cameras:
+                        first = camera_inputs[cam][:, [0]]
+                        if cam in predict_cameras:
+                            next_frame = detach_preds[cam][:, [0]]
+                        else:
+                            next_frame = camera_outputs[cam][:, [0]]
+                        cur_inputs[cam] = torch.cat([first, next_frame], dim=1)
+                    cur_states = torch.cat([data_state[:, [0]], detach_pred_state[:, [0]]], dim=1)
+                    loss_ar = torch.tensor(0.0, device=device)
+                    mse = nn.MSELoss(reduction="mean")
+
+                    for step in range(1, k + 1):
+                        # Actions: from step-1 to step
+                        ar_acs = norm_acs[:, [step - 1, step]]
+                        preds_ar, pred_state_ar = transition(cur_inputs, cur_states, ar_acs)
+                        # Compare predicted (step+1) with GT: state at step+1, camera at step
+                        loss_ar = loss_ar + mse(pred_state_ar[:, 1], data_state[:, step + 1])
+                        for cam in predict_cameras:
+                            loss_ar = loss_ar + mse(preds_ar[cam][:, 1], camera_outputs[cam][:, step])
+                        # Shift window for next step: use pred as new last frame
+                        if step < k:
+                            for cam in condition_cameras:
+                                if cam in predict_cameras:
+                                    next_frame = preds_ar[cam][:, [1]].detach()
+                                else:
+                                    next_frame = camera_outputs[cam][:, [step]]
+                                cur_inputs[cam] = torch.cat([cur_inputs[cam][:, 1:], next_frame], dim=1)
+                            cur_states = torch.cat([cur_states[:, 1:], pred_state_ar[:, [1]].detach()], dim=1)
 
         loss = loss_tf + args.ar_loss_weight * loss_ar
 
@@ -451,12 +544,12 @@ def main():
             try:
                 eval_data = next(eval_loader)
             except StopIteration:
-                eval_loader = iter(DataLoader(eval_ds, **dl_kwargs))
+                eval_loader = iter(DataLoader(eval_ds, **eval_dl_kwargs))
                 eval_data = next(eval_loader)
 
             transition.eval()
             with torch.no_grad():
-                non_blocking = dl_kwargs.get("pin_memory", False)
+                non_blocking = base_dl_kwargs.get("pin_memory", False)
                 eval_inputs = {}
                 eval_outputs = {}
                 for cam in cameras:
