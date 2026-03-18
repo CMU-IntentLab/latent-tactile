@@ -26,7 +26,7 @@ except ImportError:
     HAS_WANDB = False
 
 from tactile_dataset import TactileTrajectoryDataset, CAMERA_CONFIG, load_full_episode
-from dino_models import TactileVideoTransformer, normalize_acs, normalize_states
+from dino_models import TactileVideoTransformer, NormStats
 from dino_decoder import VQVAE
 
 # DINOv3 ViT-B/16: 196 patches (14x14), 768 dim. AnyTouch: 512 dim.
@@ -102,6 +102,7 @@ def create_episode_videos(
     condition_cameras: list,
     args,
     device: str,
+    norm_stats: NormStats,
 ) -> dict:
     """
     Load full episodes, run autoregressive rollout, decode to images, create gt/pred/diff videos.
@@ -155,11 +156,11 @@ def create_episode_videos(
         # Build full episode tensors (sliced from start_idx)
         states = torch.tensor(ep_data["states"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
         if args.normalize_states:
-            states = normalize_states(states, device, args.norm_stats_path)
+            states = norm_stats.normalize_states(states)
         actions = torch.tensor(ep_data["actions"][start_idx : start_idx + T], dtype=torch.float32, device=device).unsqueeze(0)
         if actions.shape[-1] > 7:
             actions = actions[..., :7]
-        actions = normalize_acs(actions, device, norm_stats_path=args.norm_stats_path)
+        actions = norm_stats.normalize_acs(actions)
 
         # Pre-load all embeddings for condition cameras (for GT resets)
         all_embds = {}
@@ -348,6 +349,7 @@ def main():
 
     device = torch.device(args.device)
     H = args.segment_length - 1
+    norm_stats = NormStats(args.norm_stats_path, str(args.device))
 
     # Load world model
     camera_dims = {c: CAMERA_EMB_DIMS.get(c, 768) for c in cameras}
@@ -484,6 +486,7 @@ def main():
             condition_cameras=condition_cameras,
             args=args,
             device=device,
+            norm_stats=norm_stats,
         )
         args.num_episode_videos = orig_num
         if args.wandb and HAS_WANDB and episode_videos:

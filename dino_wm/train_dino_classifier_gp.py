@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from einops import rearrange
 from dino_decoder import VQVAE
 from test_loader import SplitTrajectoryDataset
-from dino_models import VideoTransformer, normalize_acs
+from dino_models import VideoTransformer, NormStats
 dino = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
 
 transform = transforms.Compose([           
@@ -154,6 +154,7 @@ if __name__ == "__main__":
     expert_loader_imagine = iter(DataLoader(expert_data_imagine, batch_size=1, shuffle=True))
 
     device = 'cuda:0'
+    norm_stats = NormStats(None, device)
    
     decoder = VQVAE().to(device)
     decoder.load_state_dict(torch.load('checkpoints/testing_decoder.pth'))
@@ -192,7 +193,7 @@ if __name__ == "__main__":
 
     data_acs = data['action'].to(device)
     acs = data_acs[:, :-1]
-    acs = normalize_acs(acs, device)
+    acs = norm_stats.normalize_acs(acs)
 
 
     # Forward pass
@@ -230,7 +231,7 @@ if __name__ == "__main__":
 
         data_acs = data['action'].to(device)
         acs = data_acs[:, :-1]
-        acs = normalize_acs(acs, device)
+        acs = norm_stats.normalize_acs(acs)
         
         optimizer.zero_grad()
 
@@ -264,9 +265,9 @@ if __name__ == "__main__":
                 inputs1 = eval_data1[[0], :H].to(device)
                 inputs2 = eval_data2[[0], :H].to(device)
                 all_acs = eval_data['action'][[0]].to(device)
-                all_acs = normalize_acs(all_acs, device)
+                all_acs = norm_stats.normalize_acs(all_acs)
                 acs = eval_data['action'][[0],:H].to(device)
-                acs = normalize_acs(acs, device)
+                acs = norm_stats.normalize_acs(acs)
                 states = eval_data['state'][[0],:H].to(device)
                 im1s = eval_data['agentview_image'][[0], :H].squeeze().to(device)/255.
                 im2s = eval_data['robot0_eye_in_hand_image'][[0], :H].squeeze().to(device)/255.
@@ -341,7 +342,7 @@ if __name__ == "__main__":
 
                 data_acs = eval_data['action'].to(device)
                 acs = data_acs[:, :-1]
-                acs = normalize_acs(acs, device)
+                acs = norm_stats.normalize_acs(acs)
 
                 pred1, pred2, pred_state, pred_fail = transition(inputs1, inputs2, states, acs)
                 

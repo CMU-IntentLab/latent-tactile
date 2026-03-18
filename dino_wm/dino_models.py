@@ -14,88 +14,77 @@ from typing import Tuple, Optional, List, Dict
 from torchvision import transforms
 from scipy.spatial.transform import Rotation
 
-# Fallback when norm_stats_path not provided (backward compatibility)
-_DEFAULT_MAX_AC = [0.89928758, 0.71893158, 0.69869383, 0.32456627, 0.51343921, 0.28401476, 1.0]
-_DEFAULT_MIN_AC = [-0.78933347, -1.0, -0.95038878, -0.3243517, -0.30636792, -0.30071826, -1.0]
+class NormStats:
+    """
+    Load norm stats once, reuse for normalize/unnormalize.
+    """
 
+    _DEFAULT_MIN_AC = [-0.78933347, -1.0, -0.95038878, -0.3243517, -0.30636792, -0.30071826, -1.0]
+    _DEFAULT_MAX_AC = [0.89928758, 0.71893158, 0.69869383, 0.32456627, 0.51343921, 0.28401476, 1.0]
+    _cache: Dict[str, Dict[str, torch.Tensor]] = {}
 
-def load_action_norm_stats(norm_stats_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Load min_acs and max_acs from norm_stats.json. Returns (min_ac, max_ac) tensors."""
-    with open(norm_stats_path) as f:
-        info = json.load(f)
-    print(f"Loaded action norm stats: {info}")
-    min_ac = torch.tensor(info["min_acs"], dtype=torch.float32)
-    max_ac = torch.tensor(info["max_acs"], dtype=torch.float32)
-    return min_ac, max_ac
+    @staticmethod
+    def _load(norm_stats_path: Optional[str]) -> Dict[str, torch.Tensor]:
+        cache_key = norm_stats_path if (norm_stats_path and os.path.isfile(norm_stats_path)) else "_default"
+        if cache_key in NormStats._cache:
+            return NormStats._cache[cache_key]
+        if cache_key == "_default":
+            stats = {
+                "min_ac": torch.tensor(NormStats._DEFAULT_MIN_AC, dtype=torch.float32),
+                "max_ac": torch.tensor(NormStats._DEFAULT_MAX_AC, dtype=torch.float32),
+                "min_state": None,
+                "max_state": None,
+            }
+        else:
+            with open(norm_stats_path) as f:
+                info = json.load(f)
+            print(f"Loaded norm stats: {info}")
+            stats = {
+                "min_ac": torch.tensor(info["min_acs"], dtype=torch.float32),
+                "max_ac": torch.tensor(info["max_acs"], dtype=torch.float32),
+                "min_state": torch.tensor(info["min_states"], dtype=torch.float32),
+                "max_state": torch.tensor(info["max_states"], dtype=torch.float32),
+            }
+        NormStats._cache[cache_key] = stats
+        return stats
 
+    def __init__(self, norm_stats_path: Optional[str] = None, device: str = "cuda:0"):
+        self._path = norm_stats_path
+        self._device = device
+        self._stats = self._load(norm_stats_path)
+        self._min_ac = self._stats["min_ac"].to(device)
+        self._max_ac = self._stats["max_ac"].to(device)
+        min_s, max_s = self._stats["min_state"], self._stats["max_state"]
+        self._min_state = min_s.to(device) if min_s is not None else None
+        self._max_state = max_s.to(device) if max_s is not None else None
 
-def load_state_norm_stats(norm_stats_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Load min_states and max_states from norm_stats.json. Returns (min_state, max_state) tensors."""
-    with open(norm_stats_path) as f:
-        info = json.load(f)
-    min_s = torch.tensor(info["min_states"], dtype=torch.float32)
-    max_s = torch.tensor(info["max_states"], dtype=torch.float32)
-    return min_s, max_s
+    def normalize_acs(self, acs: torch.Tensor) -> torch.Tensor:
+        ac_dim = acs.shape[-1]
+        min_ac = self._min_ac[:ac_dim]
+        max_ac = self._max_ac[:ac_dim]
+        return (acs - min_ac) / (max_ac - min_ac).clamp(min=1e-6)
 
+    def unnormalize_acs(self, acs: torch.Tensor) -> torch.Tensor:
+        ac_dim = acs.shape[-1]
+        min_ac = self._min_ac[:ac_dim]
+        max_ac = self._max_ac[:ac_dim]
+        return acs * (max_ac - min_ac) + min_ac
 
-def normalize_states(states, device="cuda:0", norm_stats_path: Optional[str] = None):
-    """Normalize states to [0, 1] using min/max from norm_stats.json."""
-    if not norm_stats_path or not os.path.isfile(norm_stats_path):
-        return states
-    min_s, max_s = load_state_norm_stats(norm_stats_path)
-    print(f"Min states: {min_s}, Max states: {max_s}")
-    min_s = min_s.to(device)
-    max_s = max_s.to(device)
-    state_dim = states.shape[-1]
-    min_s = min_s[:state_dim]
-    max_s = max_s[:state_dim]
-    return (states - min_s) / (max_s - min_s).clamp(min=1e-6)
+    def normalize_states(self, states: torch.Tensor) -> torch.Tensor:
+        if self._min_state is None:
+            return states
+        state_dim = states.shape[-1]
+        min_s = self._min_state[:state_dim]
+        max_s = self._max_state[:state_dim]
+        return (states - min_s) / (max_s - min_s).clamp(min=1e-6)
 
-
-def unnormalize_states(states, device="cuda:0", norm_stats_path: Optional[str] = None):
-    """Unnormalize states from [0, 1] back to original scale."""
-    if not norm_stats_path or not os.path.isfile(norm_stats_path):
-        return states
-    min_s, max_s = load_state_norm_stats(norm_stats_path)
-    min_s = min_s.to(device)
-    max_s = max_s.to(device)
-    state_dim = states.shape[-1]
-    min_s = min_s[:state_dim]
-    max_s = max_s[:state_dim]
-    return states * (max_s - min_s) + min_s
-
-
-def normalize_acs(acs, device="cuda:0", norm_stats_path: Optional[str] = None):
-    """Normalize actions to [0, 1] using min/max from norm_stats.json or hard-coded defaults."""
-    if norm_stats_path and os.path.isfile(norm_stats_path):
-        min_ac, max_ac = load_action_norm_stats(norm_stats_path)
-    else:
-        min_ac = torch.tensor(_DEFAULT_MIN_AC, dtype=torch.float32)
-        max_ac = torch.tensor(_DEFAULT_MAX_AC, dtype=torch.float32)
-    min_ac = min_ac.to(device)
-    max_ac = max_ac.to(device)
-    # Truncate to action dim if acs has fewer dims (e.g. 7)
-    ac_dim = acs.shape[-1]
-    min_ac = min_ac[:ac_dim]
-    max_ac = max_ac[:ac_dim]
-    norm_acs = (acs - min_ac) / (max_ac - min_ac).clamp(min=1e-6)
-    return norm_acs
-
-
-def unnormalize_acs(acs, device="cuda:0", norm_stats_path: Optional[str] = None):
-    """Unnormalize actions from [0, 1] back to original scale using norm_stats.json or defaults."""
-    if norm_stats_path and os.path.isfile(norm_stats_path):
-        min_ac, max_ac = load_action_norm_stats(norm_stats_path)
-    else:
-        min_ac = torch.tensor(_DEFAULT_MIN_AC, dtype=torch.float32)
-        max_ac = torch.tensor(_DEFAULT_MAX_AC, dtype=torch.float32)
-    min_ac = min_ac.to(device)
-    max_ac = max_ac.to(device)
-    ac_dim = acs.shape[-1]
-    min_ac = min_ac[:ac_dim]
-    max_ac = max_ac[:ac_dim]
-    acs = acs * (max_ac - min_ac) + min_ac
-    return acs
+    def unnormalize_states(self, states: torch.Tensor) -> torch.Tensor:
+        if self._min_state is None:
+            return states
+        state_dim = states.shape[-1]
+        min_s = self._min_state[:state_dim]
+        max_s = self._max_state[:state_dim]
+        return states * (max_s - min_s) + min_s
 
 
 def batch_quat_to_rotvec(quaternions):

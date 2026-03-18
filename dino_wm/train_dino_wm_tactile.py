@@ -29,7 +29,7 @@ except ImportError:
     HAS_WANDB = False
 
 from tactile_dataset import TactileTrajectoryDataset, CAMERA_CONFIG, load_full_episode
-from dino_models import TactileVideoTransformer, normalize_acs, normalize_states
+from dino_models import TactileVideoTransformer, NormStats
 
 # VQVAE Quantize needs dist_fn for training; we use a no-op for eval
 import dino_decoder as _dino_dec_mod
@@ -80,8 +80,8 @@ def parse_args():
         description="Train DINO world model on tactile dataset (see configs/default.yaml)"
     )
     p.add_argument("--config", type=str, default=config_path, help="Path to config YAML")
-    p.add_argument("--hdf5_path", type=str, required=True, help="Path to consolidated HDF5")
-    p.add_argument("--norm_stats_json", type=str, default=None)
+    p.add_argument("--hdf5_path", type=str, default=cfg.get("hdf5_path", None), help="Path to consolidated HDF5")
+    p.add_argument("--norm_stats_json", type=str, default=cfg.get("norm_stats_json", None))
     p.add_argument("--cameras", type=str, default=cfg.get("cameras", "camera_0,camera_1,camera_2"))
     p.add_argument("--condition_cameras", type=str, default=None)
     p.add_argument("--predict_cameras", type=str, default=None)
@@ -92,7 +92,7 @@ def parse_args():
     p.add_argument("--iters", type=int, default=cfg.get("iters", 100000))
     p.add_argument("--eval_every", type=int, default=cfg.get("eval_every", 1000))
     p.add_argument("--device", type=str, default=cfg.get("device", "cuda:0"))
-    p.add_argument("--wandb", action="store_true")
+    p.add_argument("--wandb", action="store_true", default=cfg.get("use_wandb", False))
     p.add_argument("--no_consolidated", action="store_true")
     p.add_argument("--seed", type=int, default=cfg.get("seed", 42))
     p.add_argument("--ar_loss_weight", type=float, default=cfg.get("ar_loss_weight", 0.5))
@@ -107,8 +107,8 @@ def parse_args():
     p.add_argument("--segment_sampling", type=str, choices=["uniform", "weighted"], default=cfg.get("segment_sampling", "uniform"))
     p.add_argument("--gripper_change_weight", type=float, default=cfg.get("gripper_change_weight", 5.0))
     p.add_argument("--weight_source", type=str, choices=["gripper_state", "gripper_change_json"], default=cfg.get("weight_source", "gripper_state"))
-    p.add_argument("--gripper_change_json_path", type=str, default=None)
-    p.add_argument("--normalize_states", action="store_true", help="Normalize states using norm_stats.json (min-max to [0,1])")
+    p.add_argument("--gripper_change_json_path", type=str, default=cfg.get("gripper_change_json_path", None))
+    p.add_argument("--normalize_states", action="store_true", default=cfg.get("normalize_states", False), help="Normalize states using norm_stats.json (min-max to [0,1])")
     p.set_defaults(normalize_states=cfg.get("normalize_states", False))
     args = p.parse_args()
     args.norm_stats_path = args.norm_stats_json or os.path.join(
@@ -146,6 +146,7 @@ def create_eval_video(
     condition_cameras: list,
     args,
     device: str,
+    norm_stats: NormStats,
 ) -> np.ndarray:
     """
     Rollout on one episode, decode to images, create video: top=GT, middle=pred, bottom=diff.
@@ -187,11 +188,11 @@ def create_eval_video(
     # Build initial inputs from episode
     states = torch.tensor(ep_data["states"][:T], dtype=torch.float32, device=device).unsqueeze(0)
     if args.normalize_states:
-        states = normalize_states(states, device, args.norm_stats_path)
+        states = norm_stats.normalize_states(states)
     actions = torch.tensor(ep_data["actions"][:T], dtype=torch.float32, device=device).unsqueeze(0)
     if actions.shape[-1] > 7:
         actions = actions[..., :7]
-    actions = normalize_acs(actions, device, norm_stats_path=args.norm_stats_path)
+    actions = norm_stats.normalize_acs(actions)
 
     inputs = {}
     for c in condition_cameras:
@@ -282,6 +283,8 @@ def main():
     EVAL_H = 16
     device = args.device
     is_consolidated = not args.no_consolidated
+
+    norm_stats = NormStats(args.norm_stats_path, device)
 
     if args.segment_sampling == "weighted" and args.weight_source == "gripper_change_json":
         if not args.gripper_change_json_path or not os.path.isfile(args.gripper_change_json_path):
@@ -406,14 +409,14 @@ def main():
 
         data_state = data["state"].to(device, non_blocking=non_blocking)
         if args.normalize_states:
-            data_state = normalize_states(data_state, device, args.norm_stats_path)
+            data_state = norm_stats.normalize_states(data_state)
         inputs_states = data_state[:, :-1]
         output_state = data_state[:, 1:]
 
         data_acs = data["action"].to(device, non_blocking=non_blocking)
         if data_acs.shape[-1] > 7:
             data_acs = data_acs[..., :7]
-        norm_acs = normalize_acs(data_acs, device, norm_stats_path=args.norm_stats_path)
+        norm_acs = norm_stats.normalize_acs(data_acs)
         acs = norm_acs[:, :-1]
 
         optimizer.zero_grad()
@@ -525,12 +528,12 @@ def main():
                 eval_states = eval_data["state"].to(device, non_blocking=non_blocking)[:, :-1]
                 eval_output_state = eval_data["state"].to(device, non_blocking=non_blocking)[:, 1:]
                 if args.normalize_states:
-                    eval_states = normalize_states(eval_states, device, args.norm_stats_path)
-                    eval_output_state = normalize_states(eval_output_state, device, args.norm_stats_path)
+                    eval_states = norm_stats.normalize_states(eval_states)
+                    eval_output_state = norm_stats.normalize_states(eval_output_state)
                 eval_acs_raw = eval_data["action"].to(device, non_blocking=non_blocking)
                 if eval_acs_raw.shape[-1] > 7:
                     eval_acs_raw = eval_acs_raw[..., :7]
-                eval_acs = normalize_acs(eval_acs_raw, device, norm_stats_path=args.norm_stats_path)[:, :-1]
+                eval_acs = norm_stats.normalize_acs(eval_acs_raw)[:, :-1]
 
                 preds_eval, pred_state_eval = transition(cond_inputs, eval_states, eval_acs)
                 eval_loss = nn.MSELoss()(pred_state_eval, eval_output_state)
@@ -564,6 +567,7 @@ def main():
                     condition_cameras,
                     args,
                     device,
+                    norm_stats,
                 )
                 if video is not None:
                     wandb.log({"eval_video": wandb.Video(video, fps=args.video_fps, format="mp4")})

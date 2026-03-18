@@ -82,7 +82,7 @@ from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from typing import Tuple, Optional
 from test_loader import SplitTrajectoryDataset
-from dino_models import Decoder, VideoTransformer, normalize_acs, batch_quat_to_rotvec, batch_rotvec_to_quat
+from dino_models import Decoder, VideoTransformer, NormStats, batch_quat_to_rotvec, batch_rotvec_to_quat
 
 def fail_loss(pred, fail_data):
     
@@ -142,6 +142,7 @@ if __name__ == "__main__":
     expert_loader = iter(DataLoader(expert_data, batch_size=BS, shuffle=True))
 
     device = 'cuda:0'
+    norm_stats = NormStats(None, device)
     H = 3
    
     #decoder = Decoder().to(device)
@@ -190,7 +191,7 @@ if __name__ == "__main__":
 
     data_acs = data['action'].to(device)
     acs = data_acs[:, :-1]
-    acs = normalize_acs(acs, device=device)
+    acs = norm_stats.normalize_acs(acs)
 
     print(data.keys())
 
@@ -231,7 +232,7 @@ if __name__ == "__main__":
 
         data_acs = data['action'].to(device)
         acs = data_acs[:, :-1]
-        acs = normalize_acs(acs, device)
+        acs = norm_stats.normalize_acs(acs)
         
         pred1, pred2, pred_state, pred_fail = transition(inputs1, inputs2, states, acs)
 
