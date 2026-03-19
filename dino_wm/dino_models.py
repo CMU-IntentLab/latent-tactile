@@ -29,21 +29,43 @@ class NormStats:
         if cache_key in NormStats._cache:
             return NormStats._cache[cache_key]
         if cache_key == "_default":
+            min_ac = torch.tensor(NormStats._DEFAULT_MIN_AC, dtype=torch.float32)
+            max_ac = torch.tensor(NormStats._DEFAULT_MAX_AC, dtype=torch.float32)
+            mean_ac = (min_ac + max_ac) / 2
+            std_ac = (max_ac - min_ac).clamp(min=1e-6) / (12 ** 0.5)  # uniform [min,max] std
             stats = {
-                "min_ac": torch.tensor(NormStats._DEFAULT_MIN_AC, dtype=torch.float32),
-                "max_ac": torch.tensor(NormStats._DEFAULT_MAX_AC, dtype=torch.float32),
-                "min_state": None,
-                "max_state": None,
+                "mean_ac": mean_ac,
+                "std_ac": std_ac,
+                "mean_state": None,
+                "std_state": None,
             }
         else:
             with open(norm_stats_path) as f:
                 info = json.load(f)
             print(f"Loaded norm stats: {info}")
+            if "mean_acs" in info and "std_acs" in info:
+                mean_ac = torch.tensor(info["mean_acs"], dtype=torch.float32)
+                std_ac = torch.tensor(info["std_acs"], dtype=torch.float32)
+            else:
+                min_ac = torch.tensor(info["min_acs"], dtype=torch.float32)
+                max_ac = torch.tensor(info["max_acs"], dtype=torch.float32)
+                mean_ac = (min_ac + max_ac) / 2
+                std_ac = (max_ac - min_ac).clamp(min=1e-6) / (12 ** 0.5)
+            if "mean_states" in info and "std_states" in info:
+                mean_state = torch.tensor(info["mean_states"], dtype=torch.float32)
+                std_state = torch.tensor(info["std_states"], dtype=torch.float32)
+            elif "min_states" in info and "max_states" in info:
+                min_s = torch.tensor(info["min_states"], dtype=torch.float32)
+                max_s = torch.tensor(info["max_states"], dtype=torch.float32)
+                mean_state = (min_s + max_s) / 2
+                std_state = (max_s - min_s).clamp(min=1e-6) / (12 ** 0.5)
+            else:
+                mean_state, std_state = None, None
             stats = {
-                "min_ac": torch.tensor(info["min_acs"], dtype=torch.float32),
-                "max_ac": torch.tensor(info["max_acs"], dtype=torch.float32),
-                "min_state": torch.tensor(info["min_states"], dtype=torch.float32),
-                "max_state": torch.tensor(info["max_states"], dtype=torch.float32),
+                "mean_ac": mean_ac,
+                "std_ac": std_ac,
+                "mean_state": mean_state,
+                "std_state": std_state,
             }
         NormStats._cache[cache_key] = stats
         return stats
@@ -52,39 +74,39 @@ class NormStats:
         self._path = norm_stats_path
         self._device = device
         self._stats = self._load(norm_stats_path)
-        self._min_ac = self._stats["min_ac"].to(device)
-        self._max_ac = self._stats["max_ac"].to(device)
-        min_s, max_s = self._stats["min_state"], self._stats["max_state"]
-        self._min_state = min_s.to(device) if min_s is not None else None
-        self._max_state = max_s.to(device) if max_s is not None else None
+        self._mean_ac = self._stats["mean_ac"].to(device)
+        self._std_ac = self._stats["std_ac"].to(device)
+        mean_s, std_s = self._stats["mean_state"], self._stats["std_state"]
+        self._mean_state = mean_s.to(device) if mean_s is not None else None
+        self._std_state = std_s.to(device) if std_s is not None else None
 
     def normalize_acs(self, acs: torch.Tensor) -> torch.Tensor:
         ac_dim = acs.shape[-1]
-        min_ac = self._min_ac[:ac_dim]
-        max_ac = self._max_ac[:ac_dim]
-        return (acs - min_ac) / (max_ac - min_ac).clamp(min=1e-6)
+        mean_ac = self._mean_ac[:ac_dim]
+        std_ac = self._std_ac[:ac_dim].clamp(min=1e-6)
+        return (acs - mean_ac) / std_ac
 
     def unnormalize_acs(self, acs: torch.Tensor) -> torch.Tensor:
         ac_dim = acs.shape[-1]
-        min_ac = self._min_ac[:ac_dim]
-        max_ac = self._max_ac[:ac_dim]
-        return acs * (max_ac - min_ac) + min_ac
+        mean_ac = self._mean_ac[:ac_dim]
+        std_ac = self._std_ac[:ac_dim]
+        return acs * std_ac + mean_ac
 
     def normalize_states(self, states: torch.Tensor) -> torch.Tensor:
-        if self._min_state is None:
+        if self._mean_state is None:
             return states
         state_dim = states.shape[-1]
-        min_s = self._min_state[:state_dim]
-        max_s = self._max_state[:state_dim]
-        return (states - min_s) / (max_s - min_s).clamp(min=1e-6)
+        mean_s = self._mean_state[:state_dim]
+        std_s = self._std_state[:state_dim].clamp(min=1e-6)
+        return (states - mean_s) / std_s
 
     def unnormalize_states(self, states: torch.Tensor) -> torch.Tensor:
-        if self._min_state is None:
+        if self._mean_state is None:
             return states
         state_dim = states.shape[-1]
-        min_s = self._min_state[:state_dim]
-        max_s = self._max_state[:state_dim]
-        return states * (max_s - min_s) + min_s
+        mean_s = self._mean_state[:state_dim]
+        std_s = self._std_state[:state_dim]
+        return states * std_s + mean_s
 
 
 def batch_quat_to_rotvec(quaternions):
