@@ -87,6 +87,7 @@ def parse_args():
     p.add_argument("--predict_cameras", type=str, default=None)
     p.add_argument("--output_dir", type=str, default=cfg.get("output_dir", "checkpoints"))
     p.add_argument("--batch_size", type=int, default=cfg.get("batch_size", 16))
+    p.add_argument("--eval_batch_size", type=int, default=cfg.get("eval_batch_size", 8), help="Smaller batch for eval to reduce OOM")
     p.add_argument("--segment_length", type=int, default=cfg.get("segment_length", 4))
     p.add_argument("--num_test", type=int, default=cfg.get("num_test", 50))
     p.add_argument("--iters", type=int, default=cfg.get("iters", 100000))
@@ -168,6 +169,24 @@ def create_eval_video(
     if "states" not in ep_data or "actions" not in ep_data:
         return None
 
+    with torch.inference_mode():
+        return _create_eval_video_impl(
+            transition, decoders, ep_data, predict_cameras, condition_cameras,
+            args, device, norm_stats,
+        )
+
+
+def _create_eval_video_impl(
+    transition,
+    decoders: dict,
+    ep_data: dict,
+    predict_cameras: list,
+    condition_cameras: list,
+    args,
+    device: str,
+    norm_stats: NormStats,
+) -> np.ndarray:
+    """Inner implementation of create_eval_video (assumes inference_mode active)."""
     T_total = ep_data[f"{predict_cameras[0]}_embd"].shape[0]
     T = min(T_total, args.eval_rollout_horizon)
     H = args.segment_length - 1
@@ -212,9 +231,7 @@ def create_eval_video(
 
         for i, cam in enumerate(predict_cameras):
             if cam in decoders:
-                emb = next_embds[cam]
-                with torch.no_grad():
-                    pred_img, _ = decoders[cam](emb)
+                pred_img, _ = decoders[cam](next_embds[cam])
                 pred_img = rearrange(pred_img, "(b t) c h w -> b t c h w", t=1)
                 pred_img = pred_img[0, 0].cpu().numpy().transpose(1, 2, 0)
                 pred_imgs[i][H + k] = np.clip(pred_img, 0, 1)
@@ -231,6 +248,7 @@ def create_eval_video(
         inp_states = torch.cat([inp_states[:, 1:], next_state], dim=1)
         if H + k + 1 < actions.shape[1]:
             inp_acs = torch.cat([inp_acs[:, 1:], actions[:, H + k : H + k + 1]], dim=1)
+        del preds
 
     # Build video: each frame = [gt_row | pred_row | diff_row], cameras concatenated horizontally
     rows = []
@@ -338,7 +356,7 @@ def main():
         train_dl_kwargs["shuffle"] = False
     else:
         train_dl_kwargs["shuffle"] = True
-    eval_dl_kwargs = {**base_dl_kwargs, "shuffle": True}
+    eval_dl_kwargs = {**base_dl_kwargs, "batch_size": args.eval_batch_size, "shuffle": True}
     train_loader = iter(DataLoader(train_ds, **train_dl_kwargs))
     eval_loader = iter(DataLoader(eval_ds, **eval_dl_kwargs))
     imagine_dl_kwargs = {**base_dl_kwargs, "batch_size": 1, "shuffle": True}
@@ -508,6 +526,8 @@ def main():
             print(f"\rIter {i}, " + ", ".join(parts), end="", flush=True)
 
         if (i + 1) % args.eval_every == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             try:
                 eval_data = next(eval_loader)
             except StopIteration:
@@ -515,7 +535,7 @@ def main():
                 eval_data = next(eval_loader)
 
             transition.eval()
-            with torch.no_grad():
+            with torch.inference_mode():
                 non_blocking = base_dl_kwargs.get("pin_memory", False)
                 eval_inputs = {}
                 eval_outputs = {}
@@ -539,9 +559,11 @@ def main():
                 eval_loss = nn.MSELoss()(pred_state_eval, eval_output_state)
                 for cam in predict_cameras:
                     eval_loss = eval_loss + nn.MSELoss()(preds_eval[cam], eval_outputs[cam])
+                eval_loss_val = eval_loss.item()
+                del preds_eval, pred_state_eval, cond_inputs, eval_inputs, eval_outputs, eval_states, eval_output_state, eval_acs, eval_acs_raw, eval_data
 
             print()
-            print(f"Iter {i}, Eval Loss: {eval_loss.item():.4f}")
+            print(f"Iter {i}, Eval Loss: {eval_loss_val:.4f}")
 
             os.makedirs(args.output_dir, exist_ok=True)
             torch.save(transition.state_dict(), f"{args.output_dir}/wm_tactile_iter{i+1}.pth")
@@ -550,7 +572,7 @@ def main():
                 torch.save(transition.state_dict(), f"{args.output_dir}/best_wm_tactile.pth")
 
             if args.wandb and HAS_WANDB:
-                wandb.log({"eval_loss": eval_loss.item()})
+                wandb.log({"eval_loss": eval_loss_val})
 
             # Log eval video every N evals (top=GT, middle=pred, bottom=diff; cameras concatenated)
             eval_count = (i + 1) // args.eval_every
@@ -559,6 +581,8 @@ def main():
                 and eval_count % args.video_every_eval == 0
             )
             if should_log_video:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 video = create_eval_video(
                     transition,
                     decoders,
