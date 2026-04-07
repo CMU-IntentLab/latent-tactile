@@ -2,9 +2,8 @@
 Dataset for tactile HDF5 format produced by hdf5_to_dataset_tactile.py.
 
 Each trajectory has:
-- camera_0, camera_1, camera_2: images (H, W, 3)
-- cam_0_patch_embd, cam_1_patch_embd, cam_tactile_patch_embd: patch embeddings (T, num_patches, emb_dim)
-- cam_0_cls_embd, cam_1_cls_embd, cam_tactile_cls_embd: CLS embeddings (T, emb_dim)
+- camera_0: RGB (e.g. ZED); cam_0_patch_embd / cam_0_cls_embd from DINO
+- camera_1: tactile RGB (e.g. GelSight); cam_tactile_patch_embd / cam_tactile_cls_embd from AnyTouch
 - states, actions
 """
 
@@ -19,19 +18,15 @@ import h5py
 from torchvision import transforms
 
 
-# Mapping from camera key to embedding and image keys
+# Mapping from logical camera key to HDF5 embedding / image keys
 CAMERA_CONFIG = {
     "camera_0": {
         "embd_key": "cam_0_patch_embd",
         "image_key": "camera_0",
     },
     "camera_1": {
-        "embd_key": "cam_1_patch_embd",
-        "image_key": "camera_1",
-    },
-    "camera_2": {
         "embd_key": "cam_tactile_patch_embd",
-        "image_key": "camera_2",
+        "image_key": "camera_1",
     },
 }
 
@@ -81,7 +76,7 @@ class TactileTrajectoryDataset(Dataset):
         """
         Args:
             hdf5_path: Path to consolidated HDF5 file, or directory containing .hdf5 files.
-            cameras: List of camera keys to load, e.g. ["camera_0", "camera_1"] or ["camera_2"].
+            cameras: Camera keys to load, e.g. ["camera_0"], ["camera_1"], or both.
             segment_length: Number of timesteps per segment (default 1 for single-frame).
             split: "train" or "test".
             num_test: Number of trajectories for test split.

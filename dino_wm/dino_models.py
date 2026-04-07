@@ -81,15 +81,22 @@ class NormStats:
         self._std_state = std_s.to(device) if std_s is not None else None
 
     def normalize_acs(self, acs: torch.Tensor) -> torch.Tensor:
+        ## only normalize the first 6 actions and keep the last as it is
         ac_dim = acs.shape[-1]
         mean_ac = self._mean_ac[:ac_dim]
         std_ac = self._std_ac[:ac_dim].clamp(min=1e-6)
+        ## normalize actions except the last one
+   
+        # return torch.cat([(acs[:, :, :6] - mean_ac[:6]) / std_ac[:6], acs[:, :, 6:]], dim=-1)
         return (acs - mean_ac) / std_ac
 
     def unnormalize_acs(self, acs: torch.Tensor) -> torch.Tensor:
         ac_dim = acs.shape[-1]
         mean_ac = self._mean_ac[:ac_dim]
         std_ac = self._std_ac[:ac_dim]
+        ## unnormalize actions except the last one
+
+        # return torch.cat([(acs[:, :, :6] * std_ac[:6]) + mean_ac[:6], acs[:, :, 6:]], dim=-1)
         return acs * std_ac + mean_ac
 
     def normalize_states(self, states: torch.Tensor) -> torch.Tensor:
@@ -98,7 +105,9 @@ class NormStats:
         state_dim = states.shape[-1]
         mean_s = self._mean_state[:state_dim]
         std_s = self._std_state[:state_dim].clamp(min=1e-6)
-        return (states - mean_s) / std_s
+        # return (states - mean_s) / std_s
+        ## only apply normalization to the first 3 states, keep the rest as is
+        return torch.cat([(states[:, :3] - mean_s[:3]) / std_s[:3], states[:, 3:]], dim=-1)
 
     def unnormalize_states(self, states: torch.Tensor) -> torch.Tensor:
         if self._mean_state is None:
@@ -106,7 +115,9 @@ class NormStats:
         state_dim = states.shape[-1]
         mean_s = self._mean_state[:state_dim]
         std_s = self._std_state[:state_dim]
-        return states * std_s + mean_s
+        # return states * std_s + mean_s
+        ## only apply unnormalization to the first 3 states
+        return torch.cat([states[:, :3] * std_s[:3] + mean_s[:3], states[:, 3:]], dim=-1)
 
 
 def batch_quat_to_rotvec(quaternions):

@@ -40,6 +40,8 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
+from utils.save_video import rgb_mp4_writer
+
 CLIP_MEAN = [0.48145466, 0.4578275, 0.40821073]
 CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 OFFSET = 130.0 / 255.0
@@ -782,72 +784,73 @@ def generate_result_video(
     video_w = plot_w_px
     video_h = plot_h_px + frame_display_h
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (video_w, video_h))
     print(f"  Rendering result video ({n_steps} frames, {video_w}x{video_h}) ...")
 
-    for t in range(n_steps):
-        fig, ax = plt.subplots(figsize=(plot_w_inches, plot_h_inches), dpi=dpi)
-        for j in range(n_texts):
-            short_label = texts[j][:50] + ("..." if len(texts[j]) > 50 else "")
-            c = colors[j % len(colors)]
-            if sim_gt is not None and sim_gt.shape[0] > 0:
-                max_t_gt = min(t + 1, sim_gt.shape[0])
+    with rgb_mp4_writer(output_path, fps) as writer:
+        for t in range(n_steps):
+            fig, ax = plt.subplots(figsize=(plot_w_inches, plot_h_inches), dpi=dpi)
+            for j in range(n_texts):
+                short_label = texts[j][:50] + ("..." if len(texts[j]) > 50 else "")
+                c = colors[j % len(colors)]
+                if sim_gt is not None and sim_gt.shape[0] > 0:
+                    max_t_gt = min(t + 1, sim_gt.shape[0])
+                    ax.plot(
+                        np.arange(max_t_gt),
+                        sim_gt[:max_t_gt, j],
+                        color=c,
+                        linewidth=1.5,
+                        linestyle="-",
+                        label=f"GT: {short_label}",
+                    )
+                max_t = min(t + 1, sim_matrix.shape[0])
                 ax.plot(
-                    np.arange(max_t_gt),
-                    sim_gt[:max_t_gt, j],
+                    np.arange(max_t),
+                    sim_matrix[:max_t, j],
                     color=c,
                     linewidth=1.5,
-                    linestyle="-",
-                    label=f"GT: {short_label}",
+                    linestyle="--" if sim_gt is not None else "-",
+                    label=f"Pred: {short_label}" if sim_gt is not None else short_label,
                 )
-            max_t = min(t + 1, sim_matrix.shape[0])
-            ax.plot(
-                np.arange(max_t),
-                sim_matrix[:max_t, j],
-                color=c,
-                linewidth=1.5,
-                linestyle="--" if sim_gt is not None else "-",
-                label=f"Pred: {short_label}" if sim_gt is not None else short_label,
-            )
-            if sim_gt is not None and sim_gt.shape[0] > 0 and t < sim_gt.shape[0]:
-                ax.scatter([t], [sim_gt[t, j]], color=c, s=25, zorder=5, marker="o")
-            if max_t > 0:
-                ax.scatter([t], [sim_matrix[t, j]], color=c, s=25, zorder=5, marker="s" if sim_gt is not None else "o")
+                if sim_gt is not None and sim_gt.shape[0] > 0 and t < sim_gt.shape[0]:
+                    ax.scatter([t], [sim_gt[t, j]], color=c, s=25, zorder=5, marker="o")
+                if max_t > 0:
+                    ax.scatter([t], [sim_matrix[t, j]], color=c, s=25, zorder=5, marker="s" if sim_gt is not None else "o")
 
-        ax.set_xlim(0, max(n_steps - 1, 1))
-        ax.set_ylim(sim_min, sim_max)
-        ax.set_xlabel("Frame index", fontsize=9)
-        ax.set_ylabel("Cosine similarity", fontsize=9)
-        ax.set_title(title, fontsize=10)
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), fontsize=7, ncol=2, framealpha=0.9)
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout(rect=[0, 0.12, 1, 1])
+            ax.set_xlim(0, max(n_steps - 1, 1))
+            ax.set_ylim(sim_min, sim_max)
+            ax.set_xlabel("Frame index", fontsize=9)
+            ax.set_ylabel("Cosine similarity", fontsize=9)
+            ax.set_title(title, fontsize=10)
+            ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), fontsize=7, ncol=2, framealpha=0.9)
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout(rect=[0, 0.12, 1, 1])
 
-        plot_img = _fig_to_array(fig)
-        plt.close(fig)
-        plot_img = cv2.resize(plot_img, (plot_w_px, plot_h_px), interpolation=cv2.INTER_AREA)
+            plot_img = _fig_to_array(fig)
+            plt.close(fig)
+            plot_img = cv2.resize(plot_img, (plot_w_px, plot_h_px), interpolation=cv2.INTER_AREA)
 
-        frame_idx = min(t, len(video_frames) - 1)
-        tactile_frame = video_frames[frame_idx]
-        tactile_frame = cv2.resize(tactile_frame, (video_w, tactile_display_h), interpolation=cv2.INTER_AREA)
-        combined = np.vstack([plot_img, tactile_frame])
+            frame_idx = min(t, len(video_frames) - 1)
+            tactile_frame = video_frames[frame_idx]
+            tactile_frame = cv2.resize(tactile_frame, (video_w, tactile_display_h), interpolation=cv2.INTER_AREA)
+            combined = np.vstack([plot_img, tactile_frame])
 
-        if motion_row_frames:
-            motion_idx = min(t, len(motion_row_frames) - 1)
-            motion_frame = motion_row_frames[motion_idx]
-            motion_frame = cv2.resize(motion_frame, (video_w, tactile_display_h), interpolation=cv2.INTER_AREA)
-            combined = np.vstack([combined, motion_frame])
+            if motion_row_frames:
+                motion_idx = min(t, len(motion_row_frames) - 1)
+                motion_frame = motion_row_frames[motion_idx]
+                motion_frame = cv2.resize(motion_frame, (video_w, tactile_display_h), interpolation=cv2.INTER_AREA)
+                combined = np.vstack([combined, motion_frame])
 
-        if rgb_frames:
-            rgb_idx = min(t, len(rgb_frames) - 1)
-            rgb_frame = rgb_frames[rgb_idx]
-            rgb_frame = cv2.resize(rgb_frame, (video_w, tactile_display_h), interpolation=cv2.INTER_AREA)
-            combined = np.vstack([combined, rgb_frame])
+            if rgb_frames:
+                rgb_idx = min(t, len(rgb_frames) - 1)
+                rgb_frame = rgb_frames[rgb_idx]
+                rgb_frame = cv2.resize(rgb_frame, (video_w, tactile_display_h), interpolation=cv2.INTER_AREA)
+                combined = np.vstack([combined, rgb_frame])
 
-        writer.write(cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
+            frame_rgb = np.ascontiguousarray(combined)
+            if frame_rgb.dtype != np.uint8:
+                frame_rgb = np.clip(frame_rgb, 0, 255).astype(np.uint8)
+            writer.append_data(frame_rgb)
 
-    writer.release()
     print(f"  Video saved to {output_path}")
 
 
@@ -926,6 +929,7 @@ def run_video_mode(args):
 
         motion_row_frames = None
         frames_for_video = frames_per_window
+        breakpoint()
         if args.save_video:
             if args.eval_video_format and raw_frames is not None:
                 # Eval format: use horizontal [gt|pred|diff] for display, gt+pred for motion

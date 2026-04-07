@@ -19,7 +19,7 @@ def main():
     p.add_argument("--segment_length", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--iters", type=int, default=5000)
-    p.add_argument("--cameras", type=str, default="camera_0,camera_1,camera_2")
+    p.add_argument("--cameras", type=str, default="camera_0,camera_1")
     args = p.parse_args()
 
     cameras = [c.strip() for c in args.cameras.split(",")]

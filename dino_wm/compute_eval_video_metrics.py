@@ -20,6 +20,8 @@ import tempfile
 import cv2
 import numpy as np
 
+from utils.save_video import rgb_mp4_writer, save_rgb_mp4
+
 # Optional metrics dependencies
 try:
     from skimage.metrics import structural_similarity as ssim_fn
@@ -276,15 +278,20 @@ def _frames_to_video_file(
     h, w = selected[0].shape[:2]
     if (h, w) != (resolution, resolution):
         selected = [cv2.resize(f, (resolution, resolution), interpolation=cv2.INTER_LINEAR) for f in selected]
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (resolution, resolution))
+    rgb_frames = []
     for f in selected:
         if f.shape[-1] == 3:
-            bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+            fr = np.ascontiguousarray(f)
         else:
-            bgr = f
-        writer.write(bgr)
-    writer.release()
+            g = np.squeeze(f)
+            if g.ndim == 2:
+                fr = np.stack([g, g, g], axis=-1)
+            else:
+                fr = np.repeat(g[..., :1], 3, axis=-1)
+        if fr.dtype != np.uint8:
+            fr = np.clip(fr, 0, 255).astype(np.uint8)
+        rgb_frames.append(fr)
+    save_rgb_mp4(out_path, np.stack(rgb_frames, axis=0), fps)
 
 
 def _get_safe_device() -> str:
@@ -699,30 +706,29 @@ def concatenate_videos_horizontally(
     w_first, h_first, fps_first = get_video_props(paths[0])
     out_fps = fps if fps is not None else fps_first / 3
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out_w = 0
     out_h = header_height + h_max
 
-    for frame_idx in range(n_frames):
-        row_parts = []
-        for vid_idx, (frames, label) in enumerate(zip(frames_list, labels)):
-            if frame_idx < len(frames):
-                frame = frames[frame_idx]
-            else:
-                frame = frames[-1].copy() if frames else np.zeros((h_max, w_first, 3), dtype=np.uint8)
-            h, w = frame.shape[:2]
-            if h != h_max:
-                frame = cv2.resize(frame, (w, h_max), interpolation=cv2.INTER_LINEAR)
-            header = make_header_with_label(w, label, header_height)
-            block = np.concatenate([header, frame], axis=0)
-            row_parts.append(block)
-        out_frame = np.concatenate(row_parts, axis=1)
-        if frame_idx == 0:
-            out_w = out_frame.shape[1]
-            writer = cv2.VideoWriter(output_path, fourcc, out_fps, (out_w, out_h))
-        writer.write(out_frame)
-
-    writer.release()
+    with rgb_mp4_writer(output_path, out_fps) as writer:
+        for frame_idx in range(n_frames):
+            row_parts = []
+            for vid_idx, (frames, label) in enumerate(zip(frames_list, labels)):
+                if frame_idx < len(frames):
+                    frame = frames[frame_idx]
+                else:
+                    frame = frames[-1].copy() if frames else np.zeros((h_max, w_first, 3), dtype=np.uint8)
+                h, w = frame.shape[:2]
+                if h != h_max:
+                    frame = cv2.resize(frame, (w, h_max), interpolation=cv2.INTER_LINEAR)
+                header = make_header_with_label(w, label, header_height)
+                block = np.concatenate([header, frame], axis=0)
+                row_parts.append(block)
+            out_frame = np.concatenate(row_parts, axis=1)
+            if frame_idx == 0:
+                out_w = out_frame.shape[1]
+            if out_frame.dtype != np.uint8:
+                out_frame = np.clip(out_frame, 0, 255).astype(np.uint8)
+            writer.append_data(np.ascontiguousarray(out_frame))
     print(f"  Saved: {output_path} ({n_frames} frames, {out_w}x{out_h})")
 
 

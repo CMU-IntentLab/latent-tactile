@@ -141,7 +141,7 @@ def parse_args():
     p.add_argument("--config", type=str, default=config_path)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--hdf5_path", type=str, required=True)
-    p.add_argument("--cameras", type=str, required=True, help="Cameras this decoder was trained on, e.g. 'camera_0,camera_1' or 'camera_2'")
+    p.add_argument("--cameras", type=str, required=True, help="Cameras this decoder was trained on, e.g. 'camera_0' or 'camera_1'")
     p.add_argument("--emb_dim", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=cfg.get("batch_size", 64))
     p.add_argument("--segment_length", type=int, default=cfg.get("segment_length", 1))

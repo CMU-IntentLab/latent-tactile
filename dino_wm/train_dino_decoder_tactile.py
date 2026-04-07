@@ -2,15 +2,14 @@
 Train DINO decoder on tactile dataset from hdf5_to_dataset_tactile.py.
 
 Supports training modes:
-- tactile (default): Vision (camera_0, camera_1) share one decoder (emb_dim=384);
-  tactile (camera_2) has its own decoder with native embedding dim. No projectors.
+- tactile (default): ``camera_0`` (RGB / DINO) and ``camera_1`` (tactile / AnyTouch) each get
+  their own decoder (different embedding dims). No projectors.
 - per_camera: One decoder per camera
-- all: One shared decoder for all cameras
+- all: One shared decoder for all cameras (only if embedding dims match)
 - custom: Subset via --cameras
 
 Dataset format (from hdf5_to_dataset_tactile.py):
-- camera_0, camera_1: DINO patch embeddings (14×14)
-- camera_2: AnyTouch patch embeddings
+- ``camera_0``: DINO patch embeddings; ``camera_1``: AnyTouch patch embeddings
 
 RAE loss (--loss rae): L1 + LPIPS + adversarial, following
   "Diffusion Transformers with Representation Autoencoders" (https://arxiv.org/abs/2510.11690)
@@ -98,7 +97,7 @@ def parse_args():
     )
     p.add_argument("--config", type=str, default=config_path)
     p.add_argument("--hdf5_path", type=str, required=True)
-    p.add_argument("--mode", type=str, choices=["tactile", "per_camera", "all", "custom"], default=cfg.get("mode", "tactile"))
+    p.add_argument("--mode", type=str, choices=["tactile", "tactile_only", "per_camera", "all", "custom"], default=cfg.get("mode", "tactile"))
     p.add_argument("--cameras", type=str, default=cfg.get("cameras"))
     p.add_argument("--output_dir", type=str, default=cfg.get("output_dir", "checkpoints"))
     p.add_argument("--batch_size", type=int, default=cfg.get("batch_size", 64))
@@ -330,7 +329,9 @@ def compute_rae_loss_components(pred: torch.Tensor, target: torch.Tensor, args) 
 def get_cameras_to_train(args) -> list[list[str]]:
     """Return list of camera groups. Each group is trained together (one decoder per group)."""
     if args.mode == "tactile":
-        return [["camera_0", "camera_1"], ["camera_2"]]
+        return [["camera_0"], ["camera_1"]]
+    if args.mode == "tactile_only":
+        return [["camera_1"]]
     if args.mode == "per_camera":
         return [[c] for c in CAMERA_CONFIG.keys()]
     if args.mode == "all":
@@ -352,7 +353,7 @@ def train_one_decoder(
     args,
 ) -> VQVAE:
     """Train a single decoder for the given camera group. No projectors."""
-    device = torch.device(args.device)
+    device = torch.device(args.device)    
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,

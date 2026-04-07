@@ -184,44 +184,71 @@ def create_episode_videos(
                 for t in range(H):
                     pred_embds_per_cam[c].append(gt_embds_per_cam[c][t])
 
-        # Chunked autoregressive rollout: reset to GT state/frames every chunk
-        # First chunk: 8 steps. Subsequent chunks: 8-16 steps (configurable).
-        chunk_size = args.chunk_size
-        
+        # Group predict cameras by decoder for batched decode (vision cams share decoder)
+        vision_dim = 768
+        vision_cams = [c for c in predict_cameras if c in decoders and CAMERA_EMB_DIMS.get(c, 768) == vision_dim]
+        tactile_cams = [c for c in predict_cameras if c in decoders and CAMERA_EMB_DIMS.get(c, 768) != vision_dim]
+        cam_to_idx = {c: i for i, c in enumerate(predict_cameras)}
 
-        with torch.no_grad():
+        # Chunked autoregressive rollout: reset to GT state/frames every chunk
+        chunk_size = args.chunk_size
+        use_amp = getattr(args, "amp", False)
+        episode_start_time = time.time()
+        with torch.inference_mode():
             chunk_start = 0
             chunk_idx = 0
             while chunk_start + H < T:
-               
-                chunk_size = min(chunk_size, T - chunk_start - H)  # don't exceed episode
-                if chunk_size <= 0:
+                curr_chunk_size = min(chunk_size, T - chunk_start - H)
+                if curr_chunk_size <= 0:
                     break
 
                 # Reset context from GT at chunk_start
                 inputs = {}
                 for c in condition_cameras:
                     inputs[c] = all_embds[c][:, chunk_start : chunk_start + H]
+                    ## repeat as 10 in the first dimension
+                    inputs[c] = inputs[c].repeat(10, 1, 1, 1)
                 inp_states = states[:, chunk_start : chunk_start + H]
                 inp_acs = actions[:, chunk_start : chunk_start + H]
 
+                # Pre-slice actions for this chunk to avoid repeated indexing
+                chunk_acs = actions[:, chunk_start + 1 : chunk_start + curr_chunk_size + 1]
+                ## make them all repeat as 10 in the first dimension
+                # breakpoint()
+                chunk_acs = chunk_acs.repeat(10, 1, 1)
+                inp_acs = inp_acs.repeat(10, 1, 1)
+                inp_states = inp_states.repeat(10, 1, 1)
+                
+
                 # Predict chunk_size frames autoregressively
+                # Defer CPU sync: keep pred tensors on GPU during loop, convert at end
+                pred_tensors = {i: [None] * T for i in range(len(predict_cameras))}
                 start_time = time.time()
-                for k in range(chunk_size):
-                    preds, pred_state = transition(inputs, inp_states, inp_acs)
+                for k in range(curr_chunk_size):
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        preds, pred_state = transition(inputs, inp_states, inp_acs)
                     next_embds = {c: preds[c][:, -1:] for c in predict_cameras}
                     next_state = pred_state[:, -1:]
 
                     t_pred = chunk_start + H + k
-                    for i, cam in enumerate(predict_cameras):
-                        if cam in decoders:
-                            emb = next_embds[cam]
-                            pred_img, _ = decoders[cam](emb)
-                            pred_img = rearrange(pred_img, "(b t) c h w -> b t c h w", t=1)
-                            pred_img = pred_img[0, 0].cpu().numpy().transpose(1, 2, 0)
-                            pred_imgs[i][t_pred] = np.clip(pred_img, 0, 1)
-                        if pred_embds_per_cam is not None and cam in next_embds:
-                            pred_embds_per_cam[cam].append(next_embds[cam][0, 0].cpu().numpy())
+
+                    # Batched decoder: vision cams in one call, tactile separately
+                    # with torch.amp.autocast("cuda", enabled=use_amp):
+                        # if vision_cams:
+                            # stacked = torch.cat([next_embds[c] for c in vision_cams], dim=0)
+                            # pred_imgs_batch, _ = decoders[vision_cams[0]](stacked)
+                            # pred_imgs_batch = rearrange(pred_imgs_batch, "(b t) c h w -> b t c h w", t=1)
+                            # for i, cam in enumerate(vision_cams):
+                                # pred_tensors[cam_to_idx[cam]][t_pred] = pred_imgs_batch[i, 0].clamp(0, 1)
+                        # for cam in tactile_cams:
+                        #     pred_img, _ = decoders[cam](next_embds[cam])
+                        #     pred_img = rearrange(pred_img, "(b t) c h w -> b t c h w", t=1)
+                        #     pred_tensors[cam_to_idx[cam]][t_pred] = pred_img[0, 0].clamp(0, 1)
+
+                    if pred_embds_per_cam is not None:
+                        for cam in predict_cameras:
+                            if cam in next_embds:
+                                pred_embds_per_cam[cam].append(next_embds[cam][0, 0])
 
                     # Roll context window forward
                     for c in condition_cameras:
@@ -231,12 +258,21 @@ def create_episode_videos(
                             next_gt = all_embds[c][:, chunk_start + H + k : chunk_start + H + k + 1]
                             inputs[c] = torch.cat([inputs[c][:, 1:], next_gt], dim=1)
                     inp_states = torch.cat([inp_states[:, 1:], next_state], dim=1)
-                    inp_acs = torch.cat([inp_acs[:, 1:], actions[:, chunk_start + k + 1 : chunk_start + k + 2]], dim=1)
+                    inp_acs = torch.cat([inp_acs[:, 1:], chunk_acs[:, k : k + 1]], dim=1)
 
-                chunk_start += chunk_size
-                chunk_idx += 1
+                # # Single CPU sync at end of chunk (avoids per-step sync)
+                # for i in range(len(predict_cameras)):
+                #     for t in range(chunk_start + H, chunk_start + H + curr_chunk_size):
+                #         if pred_tensors[i][t] is not None:
+                #             pred_imgs[i][t] = pred_tensors[i][t].cpu().numpy().transpose(1, 2, 0)
+                # Note: No per-chunk sync - allows CPU/GPU overlap (faster total time).
+                # Per-chunk timings will be misleading (queue time only); use --benchmark for accurate timings.
                 end_time = time.time()
-                print(f"Time taken for chunk {chunk_idx}: {end_time - start_time} seconds")
+                print(f"Time taken for chunk {chunk_idx}, {curr_chunk_size} frames: {end_time - start_time} seconds")
+                chunk_start += curr_chunk_size
+                chunk_idx += 1
+        episode_end_time = time.time()
+        print(f"Time taken for episode {ep_idx}: {episode_end_time - episode_start_time} seconds")
         # Build video: gt | pred | diff per frame, cameras concatenated horizontally
         frames = []
         for t in range(T):
@@ -257,7 +293,6 @@ def create_episode_videos(
         save_dir = args.output_dir or "./eval_embeds"
         os.makedirs(save_dir, exist_ok=True)
         video_path = os.path.join(save_dir, f"episode_{ep_idx}_traj_{traj_id}_result.mp4")
-        T_v = video.shape[0]
         save_rgb_mp4(video_path, video, args.video_fps)
         print(f"Saved video: {video_path}")
 
@@ -266,8 +301,11 @@ def create_episode_videos(
             save_dir = args.output_dir or "./eval_embeds"
             os.makedirs(save_dir, exist_ok=True)
             gt_dict = {c: gt_embds_per_cam[c] for c in predict_cameras}
+            def _to_np(x):
+                return x.cpu().numpy() if torch.is_tensor(x) else x
+
             pred_dict = {
-                c: np.stack(pred_embds_per_cam[c], axis=0) for c in predict_cameras
+                c: np.stack([_to_np(e) for e in pred_embds_per_cam[c]], axis=0) for c in predict_cameras
                 if len(pred_embds_per_cam[c]) > 0
             }
             gt_path = os.path.join(save_dir, f"episode_{ep_idx}_traj_{traj_id}_gt_embeds.npz")
@@ -319,6 +357,8 @@ def parse_args():
     p.add_argument("--gripper_idx", type=int, default=cfg.get("gripper_idx", 6))
     p.add_argument("--gripper_closed_threshold", type=float, default=cfg.get("gripper_closed_threshold", -0.5))
     p.add_argument("--chunk_size", type=int, default=cfg.get("chunk_size", 8))
+    p.add_argument("--no_compile", action="store_true", help="Disable torch.compile on world model (compile is on by default)")
+    p.add_argument("--amp", action="store_true", help="Use FP16 autocast for faster inference")
     p.add_argument("--save_embeds", action="store_true")
     p.add_argument("--normalize_states", action="store_true", help="Use when model was trained with --normalize_states")
     p.set_defaults(normalize_states=cfg.get("normalize_states", False))
@@ -369,12 +409,33 @@ def main():
     wm_state = torch.load(args.wm_checkpoint, map_location=device)
     transition.load_state_dict(_strip_compile_prefix(wm_state))
     transition.eval()
+    if not args.no_compile and hasattr(torch, "compile"):
+        transition = torch.compile(transition, mode="reduce-overhead")
+        print("Using torch.compile (mode=reduce-overhead) on world model")
 
     # Load decoders
     decoders = load_decoders(args.decoder_dir, predict_cameras, device)
     if not decoders:
         raise ValueError(f"No decoders found in {args.decoder_dir}")
     print(f"Loaded decoders for: {list(decoders.keys())}")
+    if not args.no_compile and hasattr(torch, "compile"):
+        decoders = {k: torch.compile(v, mode="reduce-overhead") for k, v in decoders.items()}
+        print("Using torch.compile on decoders")
+
+    # Warmup for torch.compile (first run compiles, subsequent runs are fast)
+    if not args.no_compile and hasattr(torch, "compile"):
+        with torch.inference_mode():
+            dummy_inputs = {
+                c: torch.randn(1, H, PATCH_SIDE_DINOV3**2, CAMERA_EMB_DIMS.get(c, 768), device=device)
+                for c in condition_cameras
+            }
+            dummy_states = torch.randn(1, H, 8, device=device)
+            dummy_acs = torch.randn(1, H, 7, device=device)
+            _ = transition(dummy_inputs, dummy_states, dummy_acs)
+            for cam, dec in decoders.items():
+                dummy_emb = torch.randn(1, 1, PATCH_SIDE_DINOV3**2, CAMERA_EMB_DIMS.get(cam, 768), device=device)
+                _ = dec(dummy_emb)
+        print("Compile warmup done")
 
     is_consolidated = not args.no_consolidated
     eval_ds = TactileTrajectoryDataset(

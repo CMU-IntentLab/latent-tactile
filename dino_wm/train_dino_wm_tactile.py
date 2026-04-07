@@ -1,7 +1,7 @@
 """
 Train DINO world model on tactile dataset.
 
-Conditions on a user-selected combination of camera embeddings (camera_0, camera_1, camera_2)
+Conditions on a user-selected combination of camera embeddings (camera_0, camera_1)
 and predicts future embeddings for those cameras. Uses DINOv3 (768-dim) for vision cameras
 and supports AnyTouch (512-dim) for tactile. Similar to train_dino_wm.py but with:
 - TactileTrajectoryDataset instead of SplitTrajectoryDataset
@@ -38,7 +38,7 @@ if not hasattr(_dino_dec_mod, "dist_fn"):
 from dino_decoder import VQVAE
 
 # DINOv3 ViT-B/16: 196 patches (14x14), 768 dim. AnyTouch: 512 dim.
-CAMERA_EMB_DIMS = {"camera_0": 768, "camera_1": 768, "camera_2": 512}
+CAMERA_EMB_DIMS = {"camera_0": 384,  "camera_1": 512}
 PATCH_SIDE_DINOV3 = 14
 
 
@@ -119,23 +119,23 @@ def parse_args():
 
 
 def load_decoders(decoder_dir: str, predict_cameras: list, device: str) -> dict:
-    """Load decoders for each camera. Vision cams share decoder_camera_0_camera_1.pth."""
+    """Load decoders for each camera. Vision cams share decoder_camera_0.pth."""
     decoders = {}
     # Vision cameras share one decoder (768 dim)
-    vision_decoder_path = os.path.join(decoder_dir, "decoder_camera_0_camera_1.pth")
-    tactile_decoder_path = os.path.join(decoder_dir, "decoder_camera_2.pth")
+    vision_decoder_path = os.path.join(decoder_dir, "decoder_camera_0.pth")
+    tactile_decoder_path = os.path.join(decoder_dir, "decoder_camera_1.pth")
     if os.path.isfile(vision_decoder_path):
-        dec = VQVAE(emb_dim=768).to(device)
+        dec = VQVAE(emb_dim=384).to(device)
         dec.load_state_dict(torch.load(vision_decoder_path, map_location=device))
         dec.eval()
         for c in predict_cameras:
-            if CAMERA_EMB_DIMS.get(c, 768) == 768:
+            if CAMERA_EMB_DIMS.get(c, 384) == 384:
                 decoders[c] = dec
-    if os.path.isfile(tactile_decoder_path) and "camera_2" in predict_cameras:
+    if os.path.isfile(tactile_decoder_path) and "camera_1" in predict_cameras:
         dec = VQVAE(emb_dim=512).to(device)
         dec.load_state_dict(torch.load(tactile_decoder_path, map_location=device))
         dec.eval()
-        decoders["camera_2"] = dec
+        decoders["camera_1"] = dec
     return decoders
 
 
@@ -296,7 +296,7 @@ def main():
     np.random.seed(args.seed)
 
     BL = args.segment_length
-    print('segment length: ', BL)
+    print("segment length: ", BL)
     H = BL - 1
     EVAL_H = 16
     device = args.device

@@ -1,9 +1,12 @@
 """
-Convert HDF5 trajectories with 3 cameras to a consolidated dataset:
-- camera_0, camera_1: RS cameras → DINOv3 patch embeddings (14×14 grid, 196 patches)
-- camera_2: Tactile camera → AnyTouch embeddings from last 4 tactile frames
+HDF5 trajectories → embeddings and optional consolidation.
 
-Requires AnyTouch2 repo for TactileVideoMAE. Set ANYTOUCH_PATH or pass --anytouch_path.
+Streams (two modalities, two HDF5 keys):
+- ``camera_0``: RGB (e.g. ZED Mini) → DINOv3 ViT-S/16 CLS + patch tokens.
+- ``camera_1``: GelSight (or other) RGB video → AnyTouch TactileVideoMAE on a sliding
+  window of the last ``num_tactile_frames`` frames per timestep (CLS + patch embeddings).
+
+The AnyTouch2 code (``model.tactile_mae``) must be importable on ``PYTHONPATH``.
 """
 
 import argparse
@@ -37,24 +40,9 @@ SENSOR_NAME_TO_ID = {
 }
 
 
-def crop_top_middle(image):
-    top = 30
-    left = 46
-    height = 180
-    width = 180
-    return TF.crop(image, top, left, height, width)
 
-
-# Front cam transforms (camera_1)
-crop_transform = transforms.Compose([
-    transforms.ToPILImage(),
-    # transforms.Lambda(lambda img: crop_top_middle(img)),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor()
-])
 DINO_crop = transforms.Compose([
     transforms.GaussianBlur(kernel_size=(5, 5), sigma=(0.1, 0.1)),
-    # transforms.Lambda(lambda img: crop_top_middle(img)),
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -76,15 +64,17 @@ DINO_transform = transforms.Compose([
 
 
 def resize_images_to_224(images, key):
-    """Resize a batch of images to 224x224."""
+    """Resize a trajectory of images to 224×224 for consolidation.
+
+    ``camera_0`` uses the same ToTensor pipeline as ``resize_transform``; ``camera_1``
+    (tactile) uses a plain PIL resize. ``key`` must be ``"camera_0"`` or ``"camera_1"``.
+    """
     resized = []
     for i in range(len(images)):
         img = images[i]
         if key == "camera_0":  # wrist camera
             img_tensor = resize_transform(img.astype(np.uint8))
-        elif key == "camera_1":  # front camera
-            img_tensor = crop_transform(img.astype(np.uint8))
-        else:  # camera_2 tactile - simple resize
+        else:  # camera_1 tactile - simple resize
             img_tensor = transforms.Compose([
                 transforms.ToPILImage(),
                 transforms.Resize((224, 224)),
@@ -95,6 +85,7 @@ def resize_images_to_224(images, key):
 
 
 def eef_pose_to_state(T, gripper):
+    """End-effector pose matrix and scalar gripper → 8-D state (xyz, quat xyzw, gripper)."""
     x, y, z = T[:3, 3]
     rotation_matrix = T[:3, :3]
     quat = R.from_matrix(rotation_matrix).as_quat()
@@ -103,8 +94,8 @@ def eef_pose_to_state(T, gripper):
 
 # ── Tactile model loading (from AnyTouch) ───────────────────────────────────
 
-def _load_tactile_model( checkpoint_path, sensor, num_frames=4, stride=2, device="cuda"):
-    """Load TactileVideoMAE from AnyTouch2 repo."""
+def _load_tactile_model(checkpoint_path, sensor, num_frames=4, stride=2, device="cuda"):
+    """Load AnyTouch ``TactileVideoMAE`` weights from ``checkpoint_path``."""
     # if anytouch_path not in sys.path:
     #     sys.path.insert(0, anytouch_path)
 
@@ -155,10 +146,14 @@ def preprocess_tactile_window(
     bg_image: np.ndarray,
 ) -> torch.Tensor:
     """
-    Preprocess a window of 4 tactile frames for AnyTouch.
-    window_frames: list of 4 RGB arrays (H, W, 3)
-    bg_image: background (no-contact) image
-    Returns: (4, 3, 224, 224) tensor
+    Preprocess one tactile window for AnyTouch (background subtraction + CLIP norm).
+
+    Args:
+        window_frames: ``num_frames`` RGB arrays ``(H, W, 3)`` uint8.
+        bg_image: Background (no-contact) frame, same layout.
+
+    Returns:
+        Tensor of shape ``(len(window_frames), 3, 224, 224)``.
     """
     to_tensor = transforms.ToTensor()
     transform = transforms.Compose([
@@ -180,10 +175,14 @@ def build_tactile_windows_per_timestep(
     num_frames: int = 4,
 ) -> list[torch.Tensor]:
     """
-    For each timestep t, build a window of the last `num_frames` tactile frames.
-    Pads with first frame when t < num_frames-1.
-    tactile_frames: (T, H, W, C) uint8
-    Returns: list of (num_frames, 3, 224, 224) tensors, one per timestep
+    For each timestep ``t``, take the last ``num_frames`` tactile frames (pad with frame 0).
+
+    Args:
+        tactile_frames: ``(T, H, W, C)`` uint8.
+        num_frames: Window length (default 4).
+
+    Returns:
+        List of length ``T``, each element a ``(num_frames, 3, 224, 224)`` tensor.
     """
     T = tactile_frames.shape[0]
     bg_image = tactile_frames[0]
@@ -207,8 +206,12 @@ def extract_tactile_embeddings_batch(
     device: torch.device,
     aggregate: str = "cls",
     batch_size: int = 32,
-) -> np.ndarray:
-    """Returns (N, 512) array of L2-normalized tactile embeddings."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """L2-normalized CLS and patch embeddings for each window.
+
+    Returns:
+        ``(cls_emb, patch_emb)`` with shapes ``(N, D)`` and ``(N, P, D)`` (model-dependent ``D``).
+    """
     all_cls_embeds = []
     all_patch_embeds = []
     for i in range(0, len(windows), batch_size):
@@ -240,6 +243,7 @@ def preprocess(
     device: str = "cuda:0",
     output_json_file: str = None,
 ):
+    """Encode each trajectory HDF5: DINO on ``camera_0``, AnyTouch on ``camera_1``, write stats JSON."""
     # dino = torch.hub.load('/home/yilin/Projects/flow_policy/git-packages/dinov3', 
     # 'dinov3_vitb16', source='local', weights = '/home/yilin/.cache/torch/hub/checkpoints/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth').to(device)
     dino = torch.hub.load('/home/yilin/Projects/flow_policy/git-packages/dinov3',
@@ -265,11 +269,11 @@ def preprocess(
                 data_group = f
             else:
                 data_group = f["data"]
-            if "camera_0" not in data_group or "camera_1" not in data_group:
-                print(f"Skipping {hdf5_file} due to missing camera_0/camera_1.")
+            if "camera_0" not in data_group:
+                print(f"Skipping {hdf5_file} due to missing camera_0.")
                 continue
-            if "camera_2" not in data_group:
-                print(f"Skipping {hdf5_file} due to missing camera_2 (tactile).")
+            if "camera_1" not in data_group:
+                print(f"Skipping {hdf5_file} due to missing camera_1 (tactile).")
                 continue
 
             # Truncation: max 400 steps; label=='4' → max 80 steps
@@ -280,8 +284,7 @@ def preprocess(
 
             actions = data_group["actions"][:T]
             cam_0 = data_group["camera_0"][:T]
-            cam_1 = data_group["camera_1"][:T]
-            cam_tactile = data_group["camera_2"][:T]
+            cam_tactile = data_group["camera_1"][:T]
 
             ee_states = data_group["ee_states"][:T]
             gripper_states = data_group["gripper_states"][:T]
@@ -289,7 +292,7 @@ def preprocess(
             # Check for partially saved embeddings (storage full during save) and delete so we recompute
             expected_len = actions.shape[0]
             embd_keys = [
-                "cam_0_cls_embd", "cam_0_patch_embd", "cam_1_cls_embd", "cam_1_patch_embd",
+                "cam_0_cls_embd", "cam_0_patch_embd",
                 "cam_tactile_cls_embd", "cam_tactile_patch_embd",
             ]
             for key in embd_keys:
@@ -299,13 +302,11 @@ def preprocess(
 
             cam_0_patch_embds = []
             cam_0_cls_embds = []
-            cam_1_patch_embds = []
-            cam_1_cls_embds = []
             cam_tactile_cls_embds = []
             cam_tactile_patch_embds = []
             states = []
 
-            # DINO embeddings for camera_0 and camera_1
+            # DINO on RGB (camera_0) only
             for t in range(actions.shape[0]):
                 if "cam_0_patch_embd" not in data_group:
                     rs_img = cam_0[t]
@@ -317,21 +318,11 @@ def preprocess(
                     cam_0_cls_embds.append(cls_emb)
                     cam_0_patch_embds.append(patch_emb)
 
-                if "cam_1_embd" not in data_group:
-                    zed_img = cam_1[t]
-                    img_PIL = Image.fromarray(np.uint8(zed_img)).convert('RGB')
-                    img_tensor = DINO_crop(img_PIL).to(device)
-                    with torch.no_grad():
-                        cls_emb = dino.forward_features(img_tensor.unsqueeze(0))['x_norm_clstoken'].squeeze().cpu().numpy()
-                        patch_emb = dino.forward_features(img_tensor.unsqueeze(0))['x_norm_patchtokens'].squeeze().cpu().numpy()
-                    cam_1_cls_embds.append(cls_emb)
-                    cam_1_patch_embds.append(patch_emb)
-
                 ee_state = eef_pose_to_state(ee_states[t].reshape(4, 4).T, gripper_states[t])
                 states.append(ee_state)
 
             # Tactile embeddings: last 4 frames per timestep
-            if "cam_tactile_embd" not in data_group:
+            if "cam_tactile_patch_embd" not in data_group:
                 tactile_windows = build_tactile_windows_per_timestep(
                     cam_tactile, num_frames=num_tactile_frames
                 )
@@ -344,10 +335,6 @@ def preprocess(
                 data_group.create_dataset("cam_0_cls_embd", data=np.stack(cam_0_cls_embds))
             if "cam_0_patch_embd" not in data_group:
                 data_group.create_dataset("cam_0_patch_embd", data=np.stack(cam_0_patch_embds))
-            if "cam_1_cls_embd" not in data_group:
-                data_group.create_dataset("cam_1_cls_embd", data=np.stack(cam_1_cls_embds))
-            if "cam_1_patch_embd" not in data_group:
-                data_group.create_dataset("cam_1_patch_embd", data=np.stack(cam_1_patch_embds))
             if "cam_tactile_cls_embd" not in data_group:
                 data_group.create_dataset("cam_tactile_cls_embd", data=np.stack(cam_tactile_cls_embds))
             if "cam_tactile_patch_embd" not in data_group:
@@ -386,7 +373,7 @@ def compute_norm_stats_only(
     consolidated_hdf5_path: str,
     output_json_file: str,
 ):
-    """Compute action/state norm stats from an already consolidated HDF5 file."""
+    """Aggregate min/max/mean/std for actions and EE states across a consolidated HDF5."""
     with h5py.File(consolidated_hdf5_path, "r") as hf:
         traj_ids = [k for k in hf.keys() if k.startswith("trajectory_")]
     traj_ids.sort()
@@ -455,7 +442,11 @@ def compute_norm_stats_only(
 
 
 def convert_hdf5_to_consolidated_hdf5(hdf5_dirs: list[str], output_hdf5_file: str):
-    """Convert all HDF5 trajectory files from given directories into a single consolidated HDF5."""
+    """Merge per-file trajectory HDF5s into one file under ``trajectory_*`` groups.
+
+    Applies the same step cap as training (400, or 80 when label ``"4"``) and resizes
+    ``camera_0`` / ``camera_1`` frames to 224×224.
+    """
     # Collect (dir, filename) pairs, then sort by (dir, filename) for deterministic order
     all_files = []
     for hdf5_dir in hdf5_dirs:
@@ -495,7 +486,7 @@ def convert_hdf5_to_consolidated_hdf5(hdf5_dirs: list[str], output_hdf5_file: st
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="HDF5 to dataset with DINO (camera_0/1) + AnyTouch (camera_2)")
+    p = argparse.ArgumentParser(description="HDF5 to dataset with DINO (camera_0) + AnyTouch (camera_1)")
     p.add_argument("--hdf5_dir", type=str, nargs="+", default=None,
                   help="Directory (or directories) with trajectory HDF5 files (required unless --norm_stats_only)")
     p.add_argument("--input_hdf5", type=str, default=None,
@@ -508,7 +499,7 @@ def parse_args():
     #               help="Path to AnyTouch2 repo (default: $ANYTOUCH_PATH or ../AnyTouch2)")
     p.add_argument("--checkpoint", type=str, default=None,
                   help="Path to AnyTouch checkpoint (required unless --norm_stats_only)")
-    p.add_argument("--sensor", type=str, default="digit",
+    p.add_argument("--sensor", type=str, default="gelsight_mini",
                   choices=list(SENSOR_NAME_TO_ID.keys()))
     p.add_argument("--num_tactile_frames", type=int, default=4)
     p.add_argument("--device", type=str, default="cuda:0")
